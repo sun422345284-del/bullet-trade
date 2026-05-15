@@ -98,11 +98,11 @@ QMT_SERVER_ACCOUNT_KEY=main
 |--------|--------|------|
 | QMT 账号 | 仿真或测试资金号 | 真实资金号 |
 | bullet-trade server | 默认 `58620`，提供行情和交易能力 | 默认 `58620`，提供行情和交易能力 |
-| 上层 V2 网关 | 如使用 AIStocks V2，策略通常连 V2 端口（例如 `59620`） | 同样连 V2 端口，V2 再连 bullet-trade server |
+| 上层调度网关 | 如使用上层网关，策略通常连接网关自己的端口 | 同样连接上层网关端口，再由网关连接 bullet-trade server |
 | 下单等待 | 可用 `TRADE_MAX_WAIT_TIME=0` 压测异步链路 | 建议保留同步等待或按单设置 `wait_timeout` |
 | 风控 | 先放宽，确认链路能跑通 | 再启用 `RISK_CHECK_ENABLED`、`MIN_BUY_ORDER_VALUE` 等 |
 
-不要把 `QMT_SERVER_PORT` 和上层 V2 端口混用：`QMT_SERVER_PORT` 是 bullet-trade server 的端口；如果策略通过 AIStocks V2 运行，V2 自己的端口应写在对应 V2 环境变量里。
+不要把 `QMT_SERVER_PORT` 和上层调度网关端口混用：`QMT_SERVER_PORT` 是 bullet-trade server 的端口；上层网关自己的端口应写在上层系统配置里。
 
 ## 6. 下单等待（同步/异步）
 
