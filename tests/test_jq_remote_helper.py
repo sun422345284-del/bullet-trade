@@ -4,6 +4,29 @@ from helpers import bullet_trade_jq_remote_helper as helper
 from tests.test_remote_server import stub_server  # 复用 stub server fixture
 
 
+def test_helper_restores_legacy_stringified_tuple_columns():
+    payload = {
+        "dtype": "dataframe",
+        "columns": [
+            "('600635.XSHG', 'time')",
+            "('600635.XSHG', 'open')",
+            "('000001.XSHG', 'open')",
+        ],
+        "records": [[1777392000000.0, 5.4, 4061.822]],
+    }
+
+    df = helper._df_from_payload(payload)
+
+    assert isinstance(df.columns, helper.pd.MultiIndex)
+    assert df.columns.names == ["field", "code"]
+    assert list(df.columns) == [
+        ("time", "600635.XSHG"),
+        ("open", "600635.XSHG"),
+        ("open", "000001.XSHG"),
+    ]
+    assert df["open"]["600635.XSHG"].iloc[0] == 5.4
+
+
 def test_helper_e2e_with_stub(stub_server):
     helper.configure(
         host=stub_server.listen,

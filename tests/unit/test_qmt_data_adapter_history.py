@@ -18,6 +18,9 @@ class _FakeProvider:
         frequency=None,
         fq=None,
         fields=None,
+        skip_paused=False,
+        panel=True,
+        fill_paused=True,
         pre_factor_ref_date=None,
     ):
         self.last_call = {
@@ -28,6 +31,9 @@ class _FakeProvider:
             "frequency": frequency,
             "fq": fq,
             "fields": fields,
+            "skip_paused": skip_paused,
+            "panel": panel,
+            "fill_paused": fill_paused,
             "pre_factor_ref_date": pre_factor_ref_date,
         }
         return pd.DataFrame({"open": [1.0], "close": [2.0]})

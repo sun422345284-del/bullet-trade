@@ -6,7 +6,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+import pandas as pd
 
 from bullet_trade.broker.qmt import QmtBroker
 from bullet_trade.core.globals import log
@@ -123,6 +125,9 @@ class QmtDataAdapter(RemoteDataAdapter):
         frequency = payload.get("frequency") or payload.get("period")
         fq = payload.get("fq")
         fields = payload.get("fields")
+        skip_paused = bool(payload.get("skip_paused", False))
+        panel = payload.get("panel", True)
+        fill_paused = payload.get("fill_paused", True)
         pre_factor_ref_date = payload.get("pre_factor_ref_date")
 
         logger.debug(f"[QmtDataAdapter.get_history] 请求参数: security={security}, count={count}, "
@@ -137,6 +142,9 @@ class QmtDataAdapter(RemoteDataAdapter):
                 frequency=frequency,
                 fq=fq,
                 fields=fields,
+                skip_paused=skip_paused,
+                panel=panel,
+                fill_paused=fill_paused,
                 pre_factor_ref_date=pre_factor_ref_date,
             )
 
@@ -597,6 +605,50 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         return response
 
 
+_PRICE_FIELD_NAMES = {
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "money",
+    "amount",
+    "avg",
+    "price",
+    "highlimit",
+    "high_limit",
+    "lowlimit",
+    "low_limit",
+    "paused",
+    "preclose",
+    "pre_close",
+    "suspendflag",
+    "suspend_flag",
+    "openinterest",
+    "open_interest",
+    "settlementprice",
+    "settelementprice",
+}
+
+
+def _price_field_tokens(values) -> Set[str]:
+    return {str(value).replace(" ", "").replace("_", "").lower() for value in values}
+
+
+def _normalise_price_multiindex_columns(columns: pd.MultiIndex) -> pd.MultiIndex:
+    if columns.nlevels != 2:
+        return columns
+    level0 = _price_field_tokens(columns.get_level_values(0))
+    level1 = _price_field_tokens(columns.get_level_values(1))
+    if (level1 & _PRICE_FIELD_NAMES) and not (level0 & _PRICE_FIELD_NAMES):
+        columns = columns.swaplevel(0, 1)
+        columns.names = ["field", "code"]
+    elif (level0 & _PRICE_FIELD_NAMES) and not (level1 & _PRICE_FIELD_NAMES):
+        columns.names = ["field", "code"]
+    return columns
+
+
 def dataframe_to_payload(df):
     if df is None:
         return {"dtype": "dataframe", "columns": [], "records": []}
@@ -624,7 +676,18 @@ def dataframe_to_payload(df):
             pass
         return value
 
+    metadata: Dict[str, Any] = {}
     try:
+        if isinstance(getattr(df, "columns", None), pd.MultiIndex):
+            df = df.copy()
+            df.columns = _normalise_price_multiindex_columns(df.columns)
+            metadata["column_tuples"] = [
+                [_coerce_value(item) for item in col]
+                for col in df.columns.tolist()
+            ]
+            metadata["column_index_names"] = [
+                _coerce_value(name) for name in (df.columns.names or [])
+            ]
         columns = list(df.columns)
         raw = df.reset_index().values.tolist() if df.index.name else df.values.tolist()
         records = [[_coerce_value(v) for v in row] for row in raw]
@@ -632,11 +695,13 @@ def dataframe_to_payload(df):
         columns = getattr(df, "columns", [])
         raw = getattr(df, "values", [])
         records = [[_coerce_value(v) for v in row] for row in raw]
-    return {
+    payload = {
         "dtype": "dataframe",
         "columns": [str(col) for col in columns],
         "records": records,
     }
+    payload.update(metadata)
+    return payload
 
 
 def dict_payload(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:

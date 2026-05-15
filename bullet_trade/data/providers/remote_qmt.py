@@ -1,13 +1,39 @@
 from __future__ import annotations
 
+import ast
 import os
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import pandas as pd
 
 from .base import DataProvider
 from ...remote import RemoteQmtConnection
+
+
+_PRICE_FIELD_NAMES = {
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "money",
+    "amount",
+    "avg",
+    "price",
+    "highlimit",
+    "lowlimit",
+    "paused",
+    "preclose",
+    "pre_close",
+    "suspendflag",
+    "suspend_flag",
+    "openinterest",
+    "open_interest",
+    "settlementprice",
+    "settelementprice",
+}
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -18,9 +44,56 @@ def _dataframe_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
     if not payload or payload.get("dtype") != "dataframe":
         return pd.DataFrame()
     columns = payload.get("columns") or []
+    column_tuples = payload.get("column_tuples") or None
     records = payload.get("records") or []
+    if column_tuples:
+        columns = _multiindex_from_payload_columns(column_tuples, payload.get("column_index_names"))
+    else:
+        columns = _parse_legacy_tuple_columns(columns)
     df = pd.DataFrame(records, columns=columns)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = _normalise_price_multiindex_columns(df.columns)
     return df
+
+
+def _price_field_tokens(values) -> Set[str]:
+    return {str(value).replace(" ", "").replace("_", "").lower() for value in values}
+
+
+def _normalise_price_multiindex_columns(columns: pd.MultiIndex) -> pd.MultiIndex:
+    if columns.nlevels != 2:
+        return columns
+    level0 = _price_field_tokens(columns.get_level_values(0))
+    level1 = _price_field_tokens(columns.get_level_values(1))
+    if (level1 & _PRICE_FIELD_NAMES) and not (level0 & _PRICE_FIELD_NAMES):
+        columns = columns.swaplevel(0, 1)
+        columns.names = ["field", "code"]
+    elif (level0 & _PRICE_FIELD_NAMES) and not (level1 & _PRICE_FIELD_NAMES):
+        columns.names = ["field", "code"]
+    return columns
+
+
+def _multiindex_from_payload_columns(column_tuples, names) -> pd.MultiIndex:
+    tuples = [tuple(items) for items in column_tuples]
+    index = pd.MultiIndex.from_tuples(tuples)
+    if names and len(names) == index.nlevels:
+        index.names = list(names)
+    return index
+
+
+def _parse_legacy_tuple_columns(columns):
+    parsed = []
+    for column in columns:
+        if not isinstance(column, str) or not column.startswith("("):
+            return columns
+        try:
+            value = ast.literal_eval(column)
+        except Exception:
+            return columns
+        if not isinstance(value, tuple) or len(value) != 2:
+            return columns
+        parsed.append(value)
+    return pd.MultiIndex.from_tuples(parsed) if parsed else columns
 
 
 class RemoteQmtProvider(DataProvider):
@@ -76,7 +149,7 @@ class RemoteQmtProvider(DataProvider):
             return date_obj
 
         payload = {
-            "security": security if isinstance(security, str) else ",".join(security),
+            "security": security,
             "start": _str_format(start_date),
             "end": _str_format(end_date),
             "frequency": frequency,

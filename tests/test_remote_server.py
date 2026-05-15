@@ -444,6 +444,41 @@ def test_remote_data_provider_dataframe_conversion():
     assert list(df["a"]) == [1, 2]
 
 
+def test_remote_data_provider_restores_multiindex_payload():
+    from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
+
+    payload = {
+        "dtype": "dataframe",
+        "columns": ["('open', '600635.XSHG')", "('close', '600635.XSHG')"],
+        "column_tuples": [["open", "600635.XSHG"], ["close", "600635.XSHG"]],
+        "column_index_names": ["field", "code"],
+        "records": [[5.4, 5.49]],
+    }
+
+    df = _dataframe_from_payload(payload)
+
+    assert isinstance(df.columns, pd.MultiIndex)
+    assert df.columns.names == ["field", "code"]
+    assert list(df.columns) == [("open", "600635.XSHG"), ("close", "600635.XSHG")]
+    assert df["close"]["600635.XSHG"].iloc[0] == 5.49
+
+
+def test_remote_data_provider_restores_legacy_stringified_tuple_columns():
+    from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
+
+    payload = {
+        "dtype": "dataframe",
+        "columns": ["('600635.XSHG', 'open')", "('600635.XSHG', 'close')"],
+        "records": [[5.4, 5.49]],
+    }
+
+    df = _dataframe_from_payload(payload)
+
+    assert isinstance(df.columns, pd.MultiIndex)
+    assert df.columns.names == ["field", "code"]
+    assert list(df.columns) == [("open", "600635.XSHG"), ("close", "600635.XSHG")]
+
+
 def test_remote_data_provider_security_info_supports_flat_response():
     from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
 
