@@ -108,6 +108,7 @@ def configure(
         account_key=account_key,
         sub_account_id=sub_account_id,
     )
+    _BROKER_CLIENT.bind_data_client(_DATA_CLIENT)
     
     _log("INFO", "初始化完成")
 
@@ -275,7 +276,19 @@ class RemoteBrokerClient:
         self._data_client = data_client
 
     # ----- 聚宽风格入口 -----
-    def order(self, security: str, amount: int, price: Optional[float] = None, side: Optional[str] = None, wait_timeout: float = 0) -> str:
+    def order(
+        self,
+        security: str,
+        amount: int,
+        price: Optional[float] = None,
+        side: Optional[str] = None,
+        wait_timeout: float = 0,
+        *,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
         """
         按数量下单。
         
@@ -284,6 +297,9 @@ class RemoteBrokerClient:
         :param price: 委托价格，None 时服务端自动使用市价单
         :param side: 方向 BUY/SELL，None 时根据 amount 正负判断
         :param wait_timeout: 等待超时秒数，0 表示异步返回
+        :param market: True 表示市价单；price 同时传入时作为保护价。None 时保持旧行为
+        :param remark/order_remark: 订单备注，透传到服务端/QMT
+        :param idempotency_key: 幂等键；不传时 helper 会为本次短连接请求自动生成
         :return: 订单 ID
         
         注意：服务端会自动处理最小手数/步进取整、停牌检查、价格笼子等。
@@ -293,10 +309,31 @@ class RemoteBrokerClient:
         actual_side = side or ("BUY" if amount > 0 else "SELL")
         qty = abs(int(amount))
         # 服务端会自动处理最小手数/步进取整
-        order = self._place_order(security, qty, price, actual_side, wait_timeout=wait_timeout)
+        order = self._place_order(
+            security,
+            qty,
+            price,
+            actual_side,
+            wait_timeout=wait_timeout,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
         return order.order_id
 
-    def order_value(self, security: str, value: float, price: Optional[float] = None, wait_timeout: float = 0) -> str:
+    def order_value(
+        self,
+        security: str,
+        value: float,
+        price: Optional[float] = None,
+        wait_timeout: float = 0,
+        *,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
         """
         按市值下单。
         
@@ -304,6 +341,9 @@ class RemoteBrokerClient:
         :param value: 目标市值（正数买入，负数卖出）
         :param price: 委托价格，None 时服务端自动使用市价单
         :param wait_timeout: 等待超时秒数，0 表示异步返回
+        :param market: True 表示市价单；price 同时传入时作为保护价。None 时保持旧行为
+        :param remark/order_remark: 订单备注，透传到服务端/QMT
+        :param idempotency_key: 幂等键；不传时 helper 会为本次短连接请求自动生成
         :return: 订单 ID
         
         注意：服务端会自动处理最小手数/步进取整，实际成交市值可能与请求略有偏差。
@@ -317,10 +357,31 @@ class RemoteBrokerClient:
         # 计算大致数量，服务端会自动按最小手数/步进取整
         qty = int(abs(value) / p)
         side = "BUY" if value > 0 else "SELL"
-        order = self._place_order(security, qty, price, side, wait_timeout=wait_timeout)
+        order = self._place_order(
+            security,
+            qty,
+            price,
+            side,
+            wait_timeout=wait_timeout,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
         return order.order_id
 
-    def order_target(self, security: str, target: int, price: Optional[float] = None, wait_timeout: float = 0) -> str:
+    def order_target(
+        self,
+        security: str,
+        target: int,
+        price: Optional[float] = None,
+        wait_timeout: float = 0,
+        *,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
         """
         调仓到目标数量。
         
@@ -328,6 +389,9 @@ class RemoteBrokerClient:
         :param target: 目标持仓数量
         :param price: 委托价格，None 时服务端自动使用市价单
         :param wait_timeout: 等待超时秒数，0 表示异步返回
+        :param market: True 表示市价单；price 同时传入时作为保护价。None 时保持旧行为
+        :param remark/order_remark: 订单备注，透传到服务端/QMT
+        :param idempotency_key: 幂等键；不传时 helper 会为本次短连接请求自动生成
         :return: 订单 ID（如果不需要交易则返回空字符串）
         
         注意：建议 target 为 100 的整数倍，服务端会自动取整。
@@ -336,9 +400,29 @@ class RemoteBrokerClient:
         delta = target - current
         if delta == 0:
             return ""
-        return self.order(security, delta, price=price, wait_timeout=wait_timeout)
+        return self.order(
+            security,
+            delta,
+            price=price,
+            wait_timeout=wait_timeout,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
 
-    def order_target_value(self, security: str, target_value: float, price: Optional[float] = None, wait_timeout: float = 0) -> str:
+    def order_target_value(
+        self,
+        security: str,
+        target_value: float,
+        price: Optional[float] = None,
+        wait_timeout: float = 0,
+        *,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
         """
         调仓到目标市值。
         
@@ -346,6 +430,9 @@ class RemoteBrokerClient:
         :param target_value: 目标持仓市值
         :param price: 委托价格，None 时服务端自动使用市价单
         :param wait_timeout: 等待超时秒数，0 表示异步返回
+        :param market: True 表示市价单；price 同时传入时作为保护价。None 时保持旧行为
+        :param remark/order_remark: 订单备注，透传到服务端/QMT
+        :param idempotency_key: 幂等键；不传时 helper 会为本次短连接请求自动生成
         :return: 订单 ID（如果不需要交易则返回空字符串）
         
         注意：服务端会自动处理最小手数/步进取整，实际市值可能与目标略有偏差。
@@ -355,7 +442,16 @@ class RemoteBrokerClient:
             raise RuntimeError("无法获取价格，无法按目标市值下单")
         # 计算目标数量，服务端会自动按最小手数/步进取整
         target_amount = int(target_value / p)
-        return self.order_target(security, target_amount, price=price, wait_timeout=wait_timeout)
+        return self.order_target(
+            security,
+            target_amount,
+            price=price,
+            wait_timeout=wait_timeout,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
 
     # ----- 基础接口 -----
     def get_account(self) -> RemoteAccount:
@@ -524,7 +620,19 @@ class RemoteBrokerClient:
         )
 
     # ----- 内部 -----
-    def _place_order(self, security: str, amount: int, price: Optional[float], side: str, wait_timeout: float) -> RemoteOrder:
+    def _place_order(
+        self,
+        security: str,
+        amount: int,
+        price: Optional[float],
+        side: str,
+        wait_timeout: float,
+        *,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> RemoteOrder:
         """
         发送下单请求到服务端。
         
@@ -541,10 +649,14 @@ class RemoteBrokerClient:
             
             payload = self._base_payload()
             
-            # 简化价格处理：price=None 表示市价单，服务端会自动计算价格笼子
-            if price is None:
+            effective_market = bool(price is None) if market is None else bool(market)
+            if effective_market:
                 style = {"type": "market"}
+                if price is not None:
+                    style["protect_price"] = float(price)
             else:
+                if price is None:
+                    raise ValueError("限价单缺少价格；请传入 price 或设置 market=True")
                 style = {"type": "limit", "price": float(price)}
             
             payload.update({
@@ -552,9 +664,15 @@ class RemoteBrokerClient:
                 "side": side,
                 "amount": amount,
                 "style": style,
+                "idempotency_key": idempotency_key or self._make_idempotency_key(security, amount, side, style),
             })
             if wait_timeout is not None:
                 payload["wait_timeout"] = wait_timeout
+            if effective_market:
+                payload["market"] = True
+            effective_remark = order_remark if order_remark is not None else remark
+            if effective_remark:
+                payload["order_remark"] = effective_remark
             
             _log("DEBUG", "[下单] 发送下单请求: payload={}", payload)
             resp = self._client.request("broker.place_order", payload)
@@ -637,6 +755,10 @@ class RemoteBrokerClient:
 
     def _base_payload(self) -> Dict[str, Any]:
         return {"account_key": self.account_key, "sub_account_id": self.sub_account_id}
+
+    def _make_idempotency_key(self, security: str, amount: int, side: str, style: Dict[str, Any]) -> str:
+        raw = f"{security}|{amount}|{side}|{style}|{time.time_ns()}|{os.urandom(8).hex()}"
+        return "bt-helper-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 # --------- TCP 客户端 ----------
@@ -1001,20 +1123,98 @@ def _df_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
 
 
 # --------- 便捷函数（JQ 兼容） ----------
-def order(security: str, amount: int, price: Optional[float] = None, side: Optional[str] = None, wait_timeout: float = 0) -> str:
-    return get_broker_client().order(security, amount, price=price, side=side, wait_timeout=wait_timeout)
+def order(
+    security: str,
+    amount: int,
+    price: Optional[float] = None,
+    side: Optional[str] = None,
+    wait_timeout: float = 0,
+    *,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order(
+        security,
+        amount,
+        price=price,
+        side=side,
+        wait_timeout=wait_timeout,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
 
 
-def order_value(security: str, value: float, price: Optional[float] = None, wait_timeout: float = 0) -> str:
-    return get_broker_client().order_value(security, value, price=price, wait_timeout=wait_timeout)
+def order_value(
+    security: str,
+    value: float,
+    price: Optional[float] = None,
+    wait_timeout: float = 0,
+    *,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order_value(
+        security,
+        value,
+        price=price,
+        wait_timeout=wait_timeout,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
 
 
-def order_target(security: str, target: int, price: Optional[float] = None, wait_timeout: float = 0) -> str:
-    return get_broker_client().order_target(security, target, price=price, wait_timeout=wait_timeout)
+def order_target(
+    security: str,
+    target: int,
+    price: Optional[float] = None,
+    wait_timeout: float = 0,
+    *,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order_target(
+        security,
+        target,
+        price=price,
+        wait_timeout=wait_timeout,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
 
 
-def order_target_value(security: str, target_value: float, price: Optional[float] = None, wait_timeout: float = 0) -> str:
-    return get_broker_client().order_target_value(security, target_value, price=price, wait_timeout=wait_timeout)
+def order_target_value(
+    security: str,
+    target_value: float,
+    price: Optional[float] = None,
+    wait_timeout: float = 0,
+    *,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order_target_value(
+        security,
+        target_value,
+        price=price,
+        wait_timeout=wait_timeout,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
 
 
 def cancel_order(order_id: str) -> Dict[str, Any]:
