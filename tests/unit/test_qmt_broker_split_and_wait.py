@@ -89,3 +89,37 @@ def test_qmt_symbol_mapping_roundtrip():
     assert broker._map_security("600000.XSHG") == "600000.SH"
     assert broker._map_to_jq_symbol("000001.SZ") == "000001.XSHE"
     assert broker._map_to_jq_symbol("300750.SZ") == "300750.XSHE"
+
+
+def test_qmt_market_price_type_prefers_peer_price_for_both_markets():
+    broker = QmtBroker(account_id="test")
+
+    class Const:
+        MARKET_PEER_PRICE_FIRST = 11
+        MARKET_MINE_PRICE_FIRST = 12
+        MARKET_SH_CONVERT_5_CANCEL = 13
+        MARKET_SZ_CONVERT_5_CANCEL = 14
+        ANY_PRICE = 15
+        FIX_PRICE = 16
+
+    assert broker._choose_market_price_type("600000.SH", Const) == Const.MARKET_PEER_PRICE_FIRST
+    assert broker._choose_market_price_type("000001.SZ", Const) == Const.MARKET_PEER_PRICE_FIRST
+    assert broker._choose_market_price_type("600000.XSHG", Const) == Const.MARKET_PEER_PRICE_FIRST
+    assert broker._choose_market_price_type("000001.XSHE", Const) == Const.MARKET_PEER_PRICE_FIRST
+    assert broker._choose_market_price_type("430047.BJ", Const) == Const.MARKET_PEER_PRICE_FIRST
+
+
+def test_qmt_market_price_type_falls_back_to_exchange_specific_five_cancel():
+    broker = QmtBroker(account_id="test")
+
+    class Const:
+        MARKET_PEER_PRICE_FIRST = None
+        MARKET_MINE_PRICE_FIRST = None
+        MARKET_SH_CONVERT_5_CANCEL = 13
+        MARKET_SZ_CONVERT_5_CANCEL = 14
+        ANY_PRICE = 15
+        FIX_PRICE = 16
+
+    assert broker._choose_market_price_type("600000.SH", Const) == Const.MARKET_SH_CONVERT_5_CANCEL
+    assert broker._choose_market_price_type("000001.SZ", Const) == Const.MARKET_SZ_CONVERT_5_CANCEL
+    assert broker._choose_market_price_type("430047.BJ", Const) == Const.MARKET_SH_CONVERT_5_CANCEL

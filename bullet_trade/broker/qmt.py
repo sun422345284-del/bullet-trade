@@ -958,20 +958,27 @@ class QmtBroker(BrokerBase):
     def _choose_market_price_type(self, security: str, xtconstant) -> Any:
         """
         根据市场选择更具体的市价类型，避免退回限价。
+
+        默认优先使用“对手方最优价”，让 order(..., price=None) 在沪深两市语义保持一致；
+        交易所专用的五档即时成交剩余撤销仅作为兼容兜底。
         """
         market = None
         if "." in security:
             market = security.split(".")[-1].upper()
-        # 上交所/北交所：最优五档即时成交剩余撤销
-        if market == "SH":
+        if market == "XSHG":
+            market = "SH"
+        elif market == "XSHE":
+            market = "SZ"
+        # 沪深北默认都优先使用对手方最优价，五档即时成交剩余撤销作为市场专用兜底。
+        # xtconstant.MARKET_PEER_PRICE_FIRST 标注支持上交所/深交所/北交所股票。
+        if market in ("SH", "BJ", "BSE"):
             return (
-                getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
-                or getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
+                getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
                 or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
+                or getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
                 or getattr(xtconstant, "ANY_PRICE", None)
                 or getattr(xtconstant, "FIX_PRICE", None)
             )
-        # 深交所：对手方最优价
         if market == "SZ":
             return (
                 getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
