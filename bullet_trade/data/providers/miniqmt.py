@@ -359,10 +359,73 @@ class MiniQMTProvider(DataProvider):
         normalized = alias.get(freq)
         if normalized:
             return normalized
+        for suffix in ("minutes", "minute", "mins", "min"):
+            if freq.endswith(suffix) and freq[: -len(suffix)].isdigit():
+                return f"{int(freq[: -len(suffix)])}m"
         # 保留 xtquant 直接支持的 n?m/n?d 形式
         if freq.endswith(("m", "d")) and freq[:-1].isdigit():
             return freq
         return "1d"
+
+    @classmethod
+    def _minute_resample_group(cls, period: str) -> Optional[int]:
+        """
+        返回需要由 1m 重采样得到的分钟周期倍数。
+
+        Args:
+            period: 已归一化或可归一化的周期文本。
+
+        Returns:
+            Optional[int]: 例如 5m 返回 5；1m、日线或非法值返回 None。
+        """
+        normalized = cls._normalize_period(period)
+        if not normalized.endswith("m") or not normalized[:-1].isdigit():
+            return None
+        group = int(normalized[:-1])
+        return group if group > 1 else None
+
+    @staticmethod
+    def _resample_minute_frame(df: pd.DataFrame, group: int) -> pd.DataFrame:
+        """
+        按聚宽 get_price 的 group_array 语义把连续 1m 数据聚合为 Xm。
+
+        最后一组允许不满 group 根，索引用该组最后一根 1m 的结束时间。
+        """
+        if df.empty or group <= 1:
+            return df.copy()
+        ordered = df.sort_index()
+        rows: List[Dict[str, Any]] = []
+        indexes = []
+        sum_fields = {"volume", "money", "amount"}
+        last_fields = {"close", "preClose", "pre_close", "openInterest", "open_interest", "time"}
+
+        for start in range(0, len(ordered), group):
+            chunk = ordered.iloc[start : start + group]
+            if chunk.empty:
+                continue
+            row: Dict[str, Any] = {}
+            for col in ordered.columns:
+                values = chunk[col]
+                if col == "open":
+                    row[col] = values.iloc[0]
+                elif col == "high":
+                    row[col] = values.max()
+                elif col == "low":
+                    row[col] = values.min()
+                elif col in sum_fields:
+                    row[col] = values.sum()
+                elif col in last_fields:
+                    row[col] = values.iloc[-1]
+                else:
+                    row[col] = values.iloc[-1]
+            rows.append(row)
+            indexes.append(chunk.index[-1])
+
+        if not rows:
+            return ordered.iloc[0:0].copy()
+        result = pd.DataFrame(rows, index=pd.DatetimeIndex(indexes))
+        result.index.name = ordered.index.name
+        return result[ordered.columns]
 
     # ------------------------ 认证 ------------------------
     def auth(
@@ -523,6 +586,47 @@ class MiniQMTProvider(DataProvider):
         xt = self._ensure_xtdata()
         security = self._normalize_security_code(security)
         period = self._normalize_period(frequency)
+        minute_group = self._minute_resample_group(period)
+        if minute_group is not None:
+            return self._get_price_single_resampled_minute(
+                xt,
+                security=security,
+                target_period=period,
+                minute_group=minute_group,
+                start_date=start_date,
+                end_date=end_date,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                pre_factor_ref_date=pre_factor_ref_date,
+            )
+        return self._get_price_single_native(
+            xt,
+            security=security,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+            skip_paused=skip_paused,
+            fq=fq,
+            count=count,
+            pre_factor_ref_date=pre_factor_ref_date,
+        )
+
+    def _get_price_single_native(
+        self,
+        xt: Any,
+        security: str,
+        period: str,
+        start_date: Optional[Union[str, datetime]],
+        end_date: Optional[Union[str, datetime]],
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
         start_str = self._format_time(start_date, period)
         end_str = self._format_time(end_date, period)
         if self.auto_download:
@@ -586,6 +690,131 @@ class MiniQMTProvider(DataProvider):
         else:
             df = raw_df
 
+        return self._finalize_price_frame(
+            df,
+            xt=xt,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+            skip_paused=skip_paused,
+            count=count,
+        )
+
+    def _get_price_single_resampled_minute(
+        self,
+        xt: Any,
+        security: str,
+        target_period: str,
+        minute_group: int,
+        start_date: Optional[Union[str, datetime]],
+        end_date: Optional[Union[str, datetime]],
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
+        source_period = "1m"
+        source_count = count * minute_group if count is not None else None
+        start_str = self._format_time(start_date, source_period)
+        end_str = self._format_time(end_date, source_period)
+        if self.auto_download:
+            handled = self._prepare_backtest_history_data(
+                xt,
+                security=security,
+                period=source_period,
+                start_date=start_date,
+                end_date=end_date,
+                count=source_count,
+            )
+            if not handled:
+                self._download_history_data(xt, security, source_period)
+
+        raw_1m = self._fetch_local_data(
+            xt,
+            security=security,
+            period=source_period,
+            start_time=start_str,
+            end_time=end_str,
+            count=source_count,
+            dividend_type="none",
+        )
+        if raw_1m.empty:
+            logger.debug("QMT %s 1m 数据为空，回退读取原生 %s 数据。", security, target_period)
+            return self._get_price_single_native(
+                xt,
+                security=security,
+                period=target_period,
+                start_date=start_date,
+                end_date=end_date,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                pre_factor_ref_date=pre_factor_ref_date,
+            )
+
+        raw_df = self._resample_minute_frame(raw_1m, minute_group)
+        if fq == "pre":
+            adj_1m = self._fetch_local_data(
+                xt,
+                security=security,
+                period=source_period,
+                start_time=start_str,
+                end_time=end_str,
+                count=source_count,
+                dividend_type="front_ratio",
+            )
+            if adj_1m.empty:
+                adj_df = self._build_adjusted_from_events(security, raw_df, direction="pre")
+            else:
+                adj_df = self._resample_minute_frame(adj_1m, minute_group)
+            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date)
+            decimals = self._infer_price_decimals_from_raw(raw_1m)
+            df = self._round_price_columns(df, decimals)
+        elif fq == "post":
+            adj_1m = self._fetch_local_data(
+                xt,
+                security=security,
+                period=source_period,
+                start_time=start_str,
+                end_time=end_str,
+                count=source_count,
+                dividend_type="back_ratio",
+            )
+            if adj_1m.empty:
+                adj_df = self._build_adjusted_from_events(security, raw_df, direction="post")
+            else:
+                adj_df = self._resample_minute_frame(adj_1m, minute_group)
+            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date, default_to_start=True)
+            decimals = self._infer_price_decimals_from_raw(raw_1m)
+            df = self._round_price_columns(df, decimals)
+        else:
+            df = raw_df
+
+        return self._finalize_price_frame(
+            df,
+            xt=xt,
+            period=target_period,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+            skip_paused=skip_paused,
+            count=count,
+        )
+
+    def _finalize_price_frame(
+        self,
+        df: pd.DataFrame,
+        xt: Any,
+        period: str,
+        start_date: Optional[Union[str, datetime]],
+        end_date: Optional[Union[str, datetime]],
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        count: Optional[int],
+    ) -> pd.DataFrame:
         # 兼容 JQData 的 skip_paused=False 行为：填充停牌日数据
         # QMT 不返回停牌日的数据，但 JQData 会返回（volume=0, paused=1）
         # 当 skip_paused=False 且有 end_date 时，检查是否需要填充停牌日

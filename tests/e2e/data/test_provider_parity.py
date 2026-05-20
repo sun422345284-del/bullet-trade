@@ -381,3 +381,42 @@ def test_multi_provider_single_day_fq_diff() -> None:
         data_api._provider = original_provider
         data_api._auth_attempted = original_auth_attempted
         data_api._security_info_cache = original_cache
+
+
+@pytest.mark.requires_qmt
+def test_miniqmt_resampled_recent_minute_bars_match_jqdata() -> None:
+    """
+    用固定的近期交易日验证 MiniQMT 由 1m 重采样出的 5m/15m 与 JQData 对齐。
+
+    日期按 2026-05-20 运行时的“上周交易日”固定，避免测试随当天日期漂移。
+    """
+    _check_prerequisites()
+    jq, mini = _authenticate_providers()
+    fields = ["open", "high", "low", "close"]
+    start = "2026-05-14 09:30:00"
+    end = "2026-05-14 10:30:00"
+
+    for frequency in ("5m", "15m"):
+        jq_df = jq.get_price(
+            SECURITY,
+            start_date=start,
+            end_date=end,
+            frequency=frequency,
+            fields=fields,
+            fq="none",
+        )
+        mini_df = mini.get_price(
+            SECURITY,
+            start_date=start,
+            end_date=end,
+            frequency=frequency,
+            fields=fields,
+            fq="none",
+        )
+        if jq_df.empty or mini_df.empty:
+            pytest.skip(f"{frequency} 数据为空，请确认 JQData 权限和 MiniQMT 1m 本地数据。")
+
+        pd.testing.assert_index_equal(mini_df.index, jq_df.index)
+        for field in fields:
+            diff = (mini_df[field].astype(float) - jq_df[field].astype(float)).abs().max()
+            assert diff <= 0.05, f"{frequency} {field} 与 JQData 最大偏差 {diff}"
