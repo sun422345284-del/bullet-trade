@@ -1289,6 +1289,98 @@ class MiniQMTProvider(DataProvider):
             dividend_type=dividend_type,
         )
 
+    @staticmethod
+    def _parse_qmt_time_values(values: Any, *, source: str, security: str, period: str) -> pd.DatetimeIndex:
+        raw = pd.Series(values)
+        if raw.empty:
+            return pd.DatetimeIndex([])
+
+        non_null = raw.dropna()
+        if non_null.empty:
+            raise KeyError(
+                f"QMT 数据时间字段为空 (source={source}, security={security}, period={period})"
+            )
+
+        if pd.api.types.is_datetime64_any_dtype(non_null):
+            idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
+        elif pd.api.types.is_numeric_dtype(non_null):
+            numeric = pd.to_numeric(raw, errors="coerce")
+            sample = numeric.dropna().abs()
+            text = raw.astype("Int64").astype(str)
+            digit_values = text[text.str.fullmatch(r"\d+")]
+            if sample.empty:
+                idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
+            elif (
+                not digit_values.empty
+                and digit_values.str.len().isin([8, 12, 14]).all()
+                and digit_values.str[:2].isin(["19", "20"]).all()
+            ):
+                max_len = digit_values.str.len().max()
+                fmt = "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                idx = pd.DatetimeIndex(pd.to_datetime(text, format=fmt, errors="coerce"))
+            elif sample.max() >= 10**13:
+                fmt = "%Y%m%d%H%M%S" if text.str.len().max() >= 14 else "%Y%m%d%H%M"
+                idx = pd.DatetimeIndex(pd.to_datetime(text, format=fmt, errors="coerce"))
+            elif sample.max() >= 10**11:
+                idx_utc = pd.to_datetime(numeric.astype("Int64"), unit="ms", utc=True, errors="coerce")
+                idx = pd.DatetimeIndex(idx_utc).tz_convert("Asia/Shanghai").tz_localize(None)
+            elif sample.max() >= 10**9:
+                idx_utc = pd.to_datetime(numeric.astype("Int64"), unit="s", utc=True, errors="coerce")
+                idx = pd.DatetimeIndex(idx_utc).tz_convert("Asia/Shanghai").tz_localize(None)
+            elif sample.max() >= 10**7:
+                text = raw.astype("Int64").astype(str)
+                idx = pd.DatetimeIndex(pd.to_datetime(text, format="%Y%m%d", errors="coerce"))
+            else:
+                idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
+        else:
+            text = raw.astype(str)
+            stripped = text.str.replace(r"\.0$", "", regex=True).str.strip()
+            digit_values = stripped[stripped.str.fullmatch(r"\d+")]
+            if not digit_values.empty and digit_values.str.len().isin([8, 12, 14]).all():
+                max_len = digit_values.str.len().max()
+                fmt = "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                idx = pd.DatetimeIndex(pd.to_datetime(stripped, format=fmt, errors="coerce"))
+            else:
+                idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
+
+        if idx.isna().any():
+            raise ValueError(
+                f"无法解析 QMT 数据时间 (source={source}, security={security}, period={period}, "
+                f"sample={raw.head(3).tolist()})"
+            )
+        if idx.tz is not None:
+            idx = idx.tz_convert("Asia/Shanghai").tz_localize(None)
+        idx = pd.DatetimeIndex(idx.to_numpy(dtype="datetime64[ns]"))
+        return idx
+
+    @classmethod
+    def _extract_qmt_time_index(cls, df: pd.DataFrame, *, security: str, period: str) -> pd.DatetimeIndex:
+        if "time" in df.columns:
+            return cls._parse_qmt_time_values(
+                df["time"],
+                source="time column",
+                security=security,
+                period=period,
+            )
+
+        if isinstance(df.index, pd.RangeIndex):
+            logger.error(
+                f"QMT _fetch_local_data: 数据缺少 'time' 列，且 index 不是时间索引！"
+                f"现有列: {list(df.columns)}, index={type(df.index).__name__}, "
+                f"security={security}, period={period}"
+            )
+            raise KeyError(
+                f"数据缺少 'time' 列且 index 不是时间戳 "
+                f"(security={security}, period={period}, columns={list(df.columns)})"
+            )
+
+        return cls._parse_qmt_time_values(
+            df.index,
+            source="index",
+            security=security,
+            period=period,
+        )
+
     def _fetch_local_data_uncached(
         self,
         xt,
@@ -1384,18 +1476,7 @@ class MiniQMTProvider(DataProvider):
         df = df.copy()
         # logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
 
-        # xtquant 时间戳为毫秒级 UTC，需要转换到沪深时区（Asia/Shanghai）再处理
-        if "time" not in df.columns:
-            logger.error(
-                f"QMT _fetch_local_data: 数据缺少 'time' 列！"
-                f"现有列: {list(df.columns)}, security={security}, period={period}"
-            )
-            raise KeyError(
-                f"数据缺少 'time' 列 (security={security}, period={period}, columns={list(df.columns)})"
-            )
-
-        idx_utc = pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
-        idx = pd.DatetimeIndex(idx_utc).tz_convert("Asia/Shanghai").tz_localize(None)
+        idx = self._extract_qmt_time_index(df, security=security, period=period)
         # Normalize daily bars to date-only index to align with JQData
         if period == "1d":
             idx = idx.normalize()

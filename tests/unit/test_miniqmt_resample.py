@@ -83,6 +83,62 @@ def _make_provider(monkeypatch, fake_xt: FakeXtData, **config) -> MiniQMTProvide
 
 
 @pytest.mark.unit
+def test_miniqmt_local_data_accepts_epoch_ms_index_without_time_column(monkeypatch):
+    times = ["2026-05-14 09:31:00", "2026-05-14 09:32:00"]
+    raw_1m = _build_minute_frame(times).set_index("time")
+    fake_xt = FakeXtData({(SECURITY_QMT, "1m", "none"): raw_1m})
+    provider = _make_provider(monkeypatch, fake_xt)
+
+    result = provider._fetch_local_data_uncached(
+        fake_xt,
+        security=SECURITY_QMT,
+        period="1m",
+        start_time="",
+        end_time="",
+        count=None,
+        dividend_type="none",
+    )
+
+    assert result.index.tolist() == pd.to_datetime(times).tolist()
+    assert result["volume"].tolist() == [10000.0, 10100.0]
+    assert "money" in result.columns
+
+
+@pytest.mark.unit
+def test_miniqmt_local_data_accepts_datetime_index_without_time_column(monkeypatch):
+    times = ["2026-05-14 09:31:00", "2026-05-14 09:32:00"]
+    raw_1m = _build_minute_frame(times).drop(columns=["time"])
+    raw_1m.index = pd.to_datetime(times)
+    fake_xt = FakeXtData({(SECURITY_QMT, "1m", "none"): raw_1m})
+    provider = _make_provider(monkeypatch, fake_xt)
+
+    result = provider._fetch_local_data_uncached(
+        fake_xt,
+        security=SECURITY_QMT,
+        period="1m",
+        start_time="",
+        end_time="",
+        count=None,
+        dividend_type="none",
+    )
+
+    assert result.index.tolist() == pd.to_datetime(times).tolist()
+    assert result["volume"].tolist() == [10000.0, 10100.0]
+
+
+@pytest.mark.unit
+def test_miniqmt_parses_compact_numeric_time_index():
+    idx = MiniQMTProvider._parse_qmt_time_values(
+        pd.Index([202605140931, 202605140932]),
+        source="index",
+        security=SECURITY_QMT,
+        period="1m",
+    )
+
+    assert idx.tolist() == pd.to_datetime(["2026-05-14 09:31:00", "2026-05-14 09:32:00"]).tolist()
+
+
+@pytest.mark.unit
 def test_miniqmt_resamples_5m_with_partial_current_bar(monkeypatch):
     times = [f"2026-05-14 09:{minute:02d}:00" for minute in range(30, 38)]
     raw_1m = _build_minute_frame(times)
