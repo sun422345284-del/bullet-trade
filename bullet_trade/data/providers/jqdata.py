@@ -1,19 +1,23 @@
-from typing import Union, List, Optional, Dict, Any, Set, Callable, Tuple
-from datetime import datetime, date as Date
+import importlib
+import json
 import logging
 import os
-import json
+from datetime import date as Date
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+
 import pandas as pd
 
+from ..cache import CacheManager
 from ..pickle_compat import install_pickle_compat_shims
+from .base import DataProvider
 
 install_pickle_compat_shims()
 
-import jqdatasdk as jq
-from jqdatasdk import finance, query
+jq = importlib.import_module("jqdatasdk")
+finance = getattr(jq, "finance")
+query = getattr(jq, "query")
 
-from .base import DataProvider
-from ..cache import CacheManager
 
 # 动态补丁：修复 jqdatasdk 的 get_price_engine 忽略 pre_factor_ref_date 的问题
 @jq.utils.assert_auth

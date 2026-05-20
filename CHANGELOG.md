@@ -3,6 +3,46 @@
 本文档记录所有重要的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.2] - 2026-05-20
+
+### 新增
+- **回测数据会话优化**：新增仅限回测生命周期的 `BacktestDataSession`，用于管理一次回测内的行情块、QMT 下载记录、current bar 快照、内存预算和统计；默认关闭，不影响既有回测和实盘
+- **回测性能 CLI 开关**：`bullet-trade backtest` 新增 `--backtest-data-session`、`--backtest-price-block-cache`、`--backtest-data-session-manifest` 和 `--backtest-data-session-max-bytes`，也支持 `BT_BACKTEST_DATA_SESSION*` 环境变量
+- **QMT 回测下载去重**：MiniQMT 回测模式支持按证券、周期和覆盖区间登记已下载历史数据，覆盖命中时跳过重复 `download_history_data`，并输出下载与缓存统计
+- **MiniQMT 分钟线重采样**：MiniQMT 支持从 1 分钟数据重采样生成多分钟 K 线，并按聚宽兼容口径处理 open/high/low/close/volume/money 等字段
+- **回测内存行情块缓存**：支持对可证明等价的历史窗口做大块读取和按 `current_dt` 切片；动态前复权场景使用真实价格与复权因子等基础输入重新锚定，避免复权结果跨日期串用
+- **JQData pickle 兼容层**：新增 `bullet_trade.data.pickle_compat`，兼容新老 `numpy._core` 与旧 pandas pickle 模块路径，降低不同 JQData/JQDataSDK 环境之间反序列化失败的概率
+
+### 修复
+- **远程市价保护价处理**：修复远程 QMT 下单链路中市价单保护价、请求价和服务端风控校验的传递问题，避免保护价被错误解释或丢失
+- **QMT 市价单参考价**：QMT broker 下单时优先使用对手方可成交价格作为市价单参考价，提升市价保护价和拆单金额估算的准确性
+- **远程 QMT get_price MultiIndex**：远程 QMT 服务端与客户端保留并恢复 DataFrame MultiIndex 列信息，修复多标的/多字段行情返回后列顺序或字段层级异常的问题
+- **远程历史行情参数透传**：QMT server adapter 透传 `skip_paused`、`panel`、`fill_paused` 和 `pre_factor_ref_date` 等参数，使远程 `history/get_price` 与本地 provider 行为更一致
+- **远程下单等待超时覆盖**：修复单笔订单 `wait_timeout` 被全局配置覆盖的问题；服务端下单链路会透传请求级等待时间
+- **聚宽远程 helper 订单兼容**：增强 `bullet_trade_jq_remote_helper.py` 对订单、成交、备注字段和状态查询的兼容处理，补齐 `get_orders/get_open_orders/get_trades` 等常见查询路径
+- **JQData 新老环境兼容**：JQData provider 在导入 `jqdatasdk` 前安装 pickle 兼容别名，避免镜像或 SDK 版本差异导致 `numpy._core`、旧 pandas 索引模块缺失
+- **QMT 本地行情兼容性**：MiniQMT 兼容本地 K 线数据缺少 `time` 列的返回形态，避免重采样或字段整理时异常退出
+- **QMT/JQData 分钟线口径对齐**：修正 QMT 多分钟重采样的成交量、成交额和 1 分钟开盘集合竞价处理，使 QMT 分钟线结果更贴近聚宽 bar 语义
+- **Tushare 行情单位与分钟线**：Tushare 日线行情统一转换到聚宽兼容单位（`volume=股`、`money=元`），分钟频率支持 `5m/5min` 等别名并使用 `trade_time` 作为索引；分钟线复权按交易日因子匹配
+
+### 增强
+- **实盘隔离保护**：回测数据会话只在 `BacktestEngine.run()` 且显式启用时生效；MiniQMT `mode=live`、QMT server adapter、实时 tick 和实盘 current data 不读取回测下载记录或内存缓存
+- **内存预算与降级**：回测缓存支持 `max_cache_bytes` 硬上限、可选最小剩余内存保护、LRU 驱逐、单块过大降级和 manifest 统计，内存不足时优先保证结果正确
+- **current data 快照**：回测同一 bar 内可复用 current data 快照，bar 推进后自动失效，减少同一时点重复行情读取
+- **下单等待文档化**：明确 `TRADE_MAX_WAIT_TIME` 与 API 级 `wait_timeout` 的关系，`None` 使用全局配置、`>0` 同步等待、`0` 异步立即返回
+
+### 文档
+- **回测数据会话文档**：新增 `docs/backtest-data-session.md`，说明启用方式、环境变量、能力边界、实盘隔离、manifest 和回滚方式
+- **完整配置参考恢复**：恢复并补全配置总览，覆盖实盘下单等待、风控、MiniQMT、回测数据会话等常用配置项
+- **配置与实盘文档补充**：更新 API、实盘、MiniQMT provider 与贡献文档，补充回测数据会话、订单等待超时、QMT 下载去重和远程市价保护价说明
+- **文档导航更新**：在 MkDocs 导航中加入回测数据会话专题
+
+### 测试
+- **回测数据会话覆盖**：新增/补强回测 session 生命周期、QMT 下载去重、行情块切片、动态复权、future guard、低内存 LRU、实盘隔离和 manifest 相关测试
+- **MiniQMT 与多数据源口径回归**：新增 MiniQMT 分钟线重采样、QMT/JQData 分钟线对齐、本地数据缺失 `time` 列、Tushare 单位转换和分钟线复权相关测试
+- **远程 QMT 与 helper 回归**：新增 MultiIndex DataFrame payload、远程历史行情参数、市价保护价、订单等待超时、订单/成交查询兼容和 QMT server adapter 下单链路测试
+- **JQData 兼容与离线测试隔离**：新增 pickle 兼容测试；真实 JQData/聚宽镜像用例标记为 `requires_network`/`requires_jqdata`，默认测试使用离线 provider，避免 CI 或本地快速测试依赖外部行情服务
+
 ## [0.7.1] - 2026-05-09
 
 ### 新增

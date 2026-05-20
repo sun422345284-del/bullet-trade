@@ -17,18 +17,19 @@ class DummyTushareModule:
 
     def pro_bar(self, **kwargs):
         self.pro_bar_calls.append(kwargs)
-        return pd.DataFrame(
-            {
-                "ts_code": [kwargs["ts_code"]],
-                "trade_date": ["20240102"],
-                "open": [1.0],
-                "high": [1.1],
-                "low": [0.9],
-                "close": [1.05],
-                "vol": [100.0],
-                "amount": [105.0],
-            }
-        )
+        data = {
+            "ts_code": [kwargs["ts_code"]],
+            "trade_date": ["20240102"],
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "vol": [100.0],
+            "amount": [105.0],
+        }
+        if "min" in str(kwargs.get("freq", "")).lower():
+            data["trade_time"] = ["2024-01-02 09:35:00"]
+        return pd.DataFrame(data)
 
 
 def _provider_with_dummy_tushare(monkeypatch):
@@ -74,6 +75,71 @@ def test_tushare_get_price_keeps_sz_000001_as_stock(monkeypatch):
 
     assert dummy_ts.pro_bar_calls[0]["ts_code"] == "000001.SZ"
     assert dummy_ts.pro_bar_calls[0]["asset"] == "E"
+
+
+@pytest.mark.unit
+def test_tushare_daily_volume_and_money_are_normalized_to_jq_units(monkeypatch):
+    provider, _ = _provider_with_dummy_tushare(monkeypatch)
+
+    df = provider.get_price(
+        "000001.XSHE",
+        start_date="2024-01-02",
+        end_date="2024-01-02",
+        fields=["volume", "money"],
+        fq=None,
+    )
+
+    assert df.loc[pd.Timestamp("2024-01-02"), "volume"] == 10000.0
+    assert df.loc[pd.Timestamp("2024-01-02"), "money"] == 105000.0
+
+
+@pytest.mark.unit
+def test_tushare_minute_alias_uses_trade_time_and_keeps_native_units(monkeypatch):
+    provider, dummy_ts = _provider_with_dummy_tushare(monkeypatch)
+
+    df = provider.get_price(
+        "000001.XSHE",
+        start_date="2024-01-02 09:30:00",
+        end_date="2024-01-02 09:35:00",
+        frequency="5m",
+        fields=["volume", "money"],
+        fq=None,
+    )
+
+    assert dummy_ts.pro_bar_calls[0]["freq"] == "5min"
+    assert df.index[0] == pd.Timestamp("2024-01-02 09:35:00")
+    assert df.iloc[0]["volume"] == 100.0
+    assert df.iloc[0]["money"] == 105.0
+
+
+@pytest.mark.unit
+def test_tushare_minute_adjustment_joins_daily_factor(monkeypatch):
+    provider = TushareProvider({"cache_dir": None})
+    df = pd.DataFrame(
+        {
+            "open": [10.0],
+            "high": [10.0],
+            "low": [10.0],
+            "close": [10.0],
+        },
+        index=pd.to_datetime(["2024-01-02 09:35:00"]),
+    )
+
+    def fake_fetch_adj_factor(security, start_dt, end_dt):
+        if pd.to_datetime(start_dt).normalize() == pd.Timestamp("2024-01-03"):
+            return pd.DataFrame({"trade_date": ["20240103"], "adj_factor": [4.0]})
+        return pd.DataFrame({"trade_date": ["20240102"], "adj_factor": [2.0]})
+
+    monkeypatch.setattr(provider, "_fetch_adj_factor", fake_fetch_adj_factor)
+
+    adjusted = provider._apply_adjustment(
+        "000001.XSHE",
+        df,
+        "pre",
+        pre_factor_ref_date="2024-01-03",
+    )
+
+    assert adjusted.loc[pd.Timestamp("2024-01-02 09:35:00"), "close"] == 5.0
 
 
 @pytest.mark.requires_network

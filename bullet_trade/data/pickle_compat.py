@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-from typing import Any, Optional, Tuple, Type
+from typing import Any, Optional, Tuple, Type, cast
 
 import numpy as np
 import pandas as pd
@@ -55,7 +55,7 @@ class _CompatFrozenNDArray(np.ndarray):
     pickle 只需要该类参与 ndarray 重建；最终返回普通 ndarray 语义即可。
     """
 
-    def __new__(cls, *args: Any, **_kwargs: Any) -> np.ndarray:
+    def __new__(cls, *args: Any, **_kwargs: Any) -> "_CompatFrozenNDArray":
         """
         创建兼容的 ndarray 对象。
 
@@ -67,8 +67,8 @@ class _CompatFrozenNDArray(np.ndarray):
             np.ndarray: 当前 numpy 可识别的数组对象。
         """
         if args and isinstance(args[0], (list, tuple, np.ndarray)):
-            return np.array(args[0]).view(cls)
-        return np.array([]).view(cls)
+            return cast("_CompatFrozenNDArray", np.array(args[0]).view(cls))
+        return cast("_CompatFrozenNDArray", np.array([]).view(cls))
 
     @staticmethod
     def _reconstruct(subtype: Type[Any], shape: Tuple[int, ...], dtype: Any) -> np.ndarray:
@@ -84,8 +84,8 @@ class _CompatFrozenNDArray(np.ndarray):
             np.ndarray: 重建后的数组对象。
         """
         if subtype is _CompatFrozenNDArray:
-            return np.ndarray._reconstruct(np.ndarray, shape, dtype)
-        return np.ndarray._reconstruct(subtype, shape, dtype)
+            return np.ndarray._reconstruct(np.ndarray, shape, dtype)  # type: ignore[attr-defined]
+        return np.ndarray._reconstruct(subtype, shape, dtype)  # type: ignore[attr-defined]
 
 
 def _import_optional_module(module_name: str) -> Optional[types.ModuleType]:
@@ -149,15 +149,16 @@ def _ensure_pandas_pickle_aliases() -> None:
     """
     if "pandas.core.indexes.numeric" not in sys.modules:
         numeric_module = _CompatModule("pandas.core.indexes.numeric")
-        numeric_module.Int64Index = _CompatNumericIndex
-        numeric_module.UInt64Index = _CompatNumericIndex
-        numeric_module.Float64Index = _CompatNumericIndex
-        numeric_module.NumericIndex = _CompatNumericIndex
+        numeric_alias = cast(Any, numeric_module)
+        numeric_alias.Int64Index = _CompatNumericIndex
+        numeric_alias.UInt64Index = _CompatNumericIndex
+        numeric_alias.Float64Index = _CompatNumericIndex
+        numeric_alias.NumericIndex = _CompatNumericIndex
         sys.modules["pandas.core.indexes.numeric"] = numeric_module
 
     if "pandas.core.indexes.frozen" not in sys.modules:
         frozen_module = _CompatModule("pandas.core.indexes.frozen")
-        frozen_module.FrozenNDArray = _CompatFrozenNDArray
+        cast(Any, frozen_module).FrozenNDArray = _CompatFrozenNDArray
         sys.modules["pandas.core.indexes.frozen"] = frozen_module
 
 

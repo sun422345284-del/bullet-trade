@@ -328,11 +328,15 @@ def test_tushare_vs_jqdata_single_day() -> None:
 
     security = "000001.XSHE"
     date_str = "2025-07-01"
+    fields = ["open", "high", "low", "close", "volume", "money"]
 
-    jq_none = jq.get_price(security, start_date=date_str, end_date=date_str, fq=None)
-    jq_pre = jq.get_price(security, start_date=date_str, end_date=date_str, fq="pre")
-    ts_none = ts.get_price(security, start_date=date_str, end_date=date_str, fq=None)
-    ts_pre = ts.get_price(security, start_date=date_str, end_date=date_str, fq="pre")
+    jq_none = jq.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq=None)
+    jq_pre = jq.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq="pre")
+    try:
+        ts_none = ts.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq=None)
+        ts_pre = ts.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq="pre")
+    except Exception as exc:
+        pytest.skip(f"Tushare 行情调用失败：{exc}")
 
     _assert_pre_diff(jq_none, jq_pre, "JQData")
     _assert_pre_diff(ts_none, ts_pre, "Tushare")
@@ -342,6 +346,11 @@ def test_tushare_vs_jqdata_single_day() -> None:
     epsilon = 0.05
     assert abs(jq_open - ts_open) <= epsilon
     assert abs(jq_close - ts_close) <= epsilon
+
+    jq_raw = jq_none.iloc[0]
+    ts_raw = ts_none.iloc[0]
+    assert abs(float(jq_raw["volume"]) - float(ts_raw["volume"])) <= 2000.0
+    assert abs(float(jq_raw["money"]) - float(ts_raw["money"])) <= 2000.0
 
 
 def test_multi_provider_single_day_fq_diff() -> None:

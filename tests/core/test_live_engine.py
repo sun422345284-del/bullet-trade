@@ -9,16 +9,20 @@ import copy
 import importlib.util
 import shutil
 import sys
-from datetime import date, datetime, timedelta, time as Time
+from datetime import date, datetime
+from datetime import time as Time
+from datetime import timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
+import pandas as pd
 import pytest
-
 
 from bullet_trade.broker.base import BrokerBase
 from bullet_trade.core import pricing
 from bullet_trade.core.async_scheduler import AsyncScheduler
 from bullet_trade.core.event_bus import EventBus
+from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.live_engine import (
     LiveConfig,
     LiveEngine,
@@ -32,12 +36,16 @@ from bullet_trade.core.live_runtime import (
     persist_strategy_metadata,
     save_g,
 )
-from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.models import Order, OrderStatus
-from bullet_trade.core.orders import LimitOrderStyle, MarketOrderStyle, order, clear_order_queue
+from bullet_trade.core.orders import (
+    LimitOrderStyle,
+    MarketOrderStyle,
+    clear_order_queue,
+    order,
+)
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.core.runtime import set_current_engine
-
+from bullet_trade.data.providers.base import DataProvider
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
@@ -48,6 +56,307 @@ sys.modules[_V2_SPEC.name] = _V2_MODULE
 _V2_SPEC.loader.exec_module(_V2_MODULE)
 AiStocksV2Broker = _V2_MODULE.AiStocksV2Broker
 V2ClientConfig = _V2_MODULE.V2ClientConfig
+
+
+class OfflineLiveProvider(DataProvider):
+    """
+    LiveEngine 测试专用离线数据源。
+
+    职责：为默认测试提供固定交易日、订阅和 tick 接口，避免 LiveEngine 单元测试误连真实行情源。
+    核心协作对象：`bullet_trade.data.api` 全局 provider 和 LiveEngine 的交易日/订阅刷新逻辑。
+    关键状态：仅维护内存中的 tick 订阅集合，不访问网络或磁盘缓存。
+    """
+
+    name = "offline_live"
+
+    def __init__(self) -> None:
+        """
+        初始化离线 provider。
+
+        Args:
+            无。
+
+        Returns:
+            None。创建空的 tick 订阅状态。
+        """
+        self.tick_symbols: set[str] = set()
+        self.tick_markets: set[str] = set()
+
+    def auth(
+        self,
+        user: Optional[str] = None,
+        pwd: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        """
+        执行离线认证。
+
+        Args:
+            user: 兼容数据源认证签名，测试中不使用。
+            pwd: 兼容数据源认证签名，测试中不使用。
+            host: 兼容数据源认证签名，测试中不使用。
+            port: 兼容数据源认证签名，测试中不使用。
+
+        Returns:
+            None。该 provider 不访问外部行情服务。
+        """
+        return None
+
+    def get_trade_days(
+        self,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        count: Optional[int] = None,
+    ) -> List[datetime]:
+        """
+        返回工作日交易日序列。
+
+        Args:
+            start_date: 查询开始日期。
+            end_date: 查询结束日期。
+            count: 需要返回的最近交易日数量。
+
+        Returns:
+            List[datetime]: 固定工作日交易日列表。
+        """
+        end_ts = pd.to_datetime(end_date or "2026-01-01").normalize()
+        if count is not None:
+            return list(pd.bdate_range(end=end_ts, periods=count).to_pydatetime())
+        start_ts = pd.to_datetime(start_date or end_ts).normalize()
+        return list(pd.bdate_range(start=start_ts, end=end_ts).to_pydatetime())
+
+    def get_price(
+        self,
+        security: Union[str, List[str]],
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        frequency: str = "daily",
+        fields: Optional[List[str]] = None,
+        skip_paused: bool = False,
+        fq: str = "pre",
+        count: Optional[int] = None,
+        panel: bool = True,
+        fill_paused: bool = True,
+        pre_factor_ref_date: Optional[Union[str, datetime]] = None,
+        prefer_engine: bool = False,
+        force_no_engine: bool = False,
+    ) -> pd.DataFrame:
+        """
+        返回固定行情。
+
+        Args:
+            security: 单个或多个证券代码。
+            start_date: 行情开始时间。
+            end_date: 行情结束时间。
+            frequency: 行情频率，测试中不影响固定返回。
+            fields: 需要返回的字段。
+            skip_paused: 兼容公开 API 参数，测试中不改变返回。
+            fq: 兼容复权参数，测试中不改变返回。
+            count: 需要返回的最近记录数量。
+            panel: 兼容公开 API 参数，多证券时返回 MultiIndex 列。
+            fill_paused: 兼容公开 API 参数，测试中不改变返回。
+            pre_factor_ref_date: 兼容动态复权参数，测试中不改变返回。
+            prefer_engine: 兼容 provider engine 参数，测试中不改变返回。
+            force_no_engine: 兼容 provider engine 参数，测试中不改变返回。
+
+        Returns:
+            pd.DataFrame: 固定价格行情表。
+        """
+        _ = (
+            frequency,
+            skip_paused,
+            fq,
+            fill_paused,
+            pre_factor_ref_date,
+            prefer_engine,
+            force_no_engine,
+        )
+        end_ts = pd.to_datetime(end_date or start_date or "2026-01-01").normalize()
+        if count is not None:
+            index = pd.bdate_range(end=end_ts, periods=count)
+        else:
+            start_ts = pd.to_datetime(start_date or end_ts).normalize()
+            index = pd.bdate_range(start=start_ts, end=end_ts)
+        if index.empty:
+            index = pd.DatetimeIndex([end_ts])
+
+        requested_fields = fields or ["open", "close", "high", "low", "volume", "money"]
+        securities = security if isinstance(security, list) else [security]
+
+        def _field_value(field: str) -> Any:
+            """
+            返回字段固定值。
+
+            Args:
+                field: 行情字段名。
+
+            Returns:
+                Any: 与字段类型匹配的固定值。
+            """
+            values: Dict[str, Any] = {
+                "open": 10.0,
+                "close": 10.0,
+                "high": 10.2,
+                "low": 9.8,
+                "high_limit": 11.0,
+                "low_limit": 9.0,
+                "paused": False,
+                "volume": 100000,
+                "money": 1000000.0,
+                "factor": 1.0,
+            }
+            return values.get(field, 10.0)
+
+        if len(securities) == 1:
+            return pd.DataFrame(
+                {field: [_field_value(field)] * len(index) for field in requested_fields},
+                index=index,
+            )
+
+        data = {
+            (field, code): [_field_value(field)] * len(index)
+            for field in requested_fields
+            for code in securities
+        }
+        return pd.DataFrame(data, index=index)
+
+    def get_all_securities(
+        self,
+        types: Union[str, List[str]] = "stock",
+        date: Optional[Union[str, datetime]] = None,
+    ) -> pd.DataFrame:
+        """
+        返回固定证券列表。
+
+        Args:
+            types: 证券类型过滤条件。
+            date: 查询日期。
+
+        Returns:
+            pd.DataFrame: 包含常用测试证券的证券表。
+        """
+        _ = types, date
+        return pd.DataFrame(
+            {"display_name": ["平安银行", "沪深300"], "type": ["stock", "index"]},
+            index=["000001.XSHE", "000300.XSHG"],
+        )
+
+    def get_index_stocks(
+        self,
+        index_symbol: str,
+        date: Optional[Union[str, datetime]] = None,
+    ) -> List[str]:
+        """
+        返回固定指数成分。
+
+        Args:
+            index_symbol: 指数代码。
+            date: 查询日期。
+
+        Returns:
+            List[str]: 固定股票列表。
+        """
+        _ = index_symbol, date
+        return ["000001.XSHE"]
+
+    def get_split_dividend(
+        self,
+        security: str,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        返回权益事件。
+
+        Args:
+            security: 证券代码。
+            start_date: 查询开始日期。
+            end_date: 查询结束日期。
+
+        Returns:
+            List[Dict[str, Any]]: LiveEngine 测试不覆盖分红，固定返回空列表。
+        """
+        _ = security, start_date, end_date
+        return []
+
+    def subscribe_ticks(self, symbols: List[str]) -> None:
+        """
+        记录 tick 订阅。
+
+        Args:
+            symbols: 需要订阅的证券代码列表。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        self.tick_symbols.update(symbols)
+
+    def subscribe_markets(self, markets: List[str]) -> None:
+        """
+        记录市场订阅。
+
+        Args:
+            markets: 需要订阅的市场列表。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        self.tick_markets.update(markets)
+
+    def unsubscribe_ticks(self, symbols: Optional[List[str]] = None) -> None:
+        """
+        取消 tick 订阅。
+
+        Args:
+            symbols: 需要取消的证券代码；为 None 时清空全部。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        if symbols is None:
+            self.tick_symbols.clear()
+            return
+        for symbol in symbols:
+            self.tick_symbols.discard(symbol)
+
+    def unsubscribe_markets(self, markets: Optional[List[str]] = None) -> None:
+        """
+        取消市场订阅。
+
+        Args:
+            markets: 需要取消的市场；为 None 时清空全部。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        if markets is None:
+            self.tick_markets.clear()
+            return
+        for market in markets:
+            self.tick_markets.discard(market)
+
+    def get_current_tick(
+        self,
+        security: str,
+        dt: Optional[Union[str, datetime]] = None,
+        df: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        返回固定 tick 快照。
+
+        Args:
+            security: 证券代码。
+            dt: 查询时间。
+            df: 是否返回 DataFrame，测试中固定返回 dict。
+
+        Returns:
+            Optional[Dict[str, Any]]: 已订阅证券返回快照，未订阅返回 None。
+        """
+        _ = dt, df
+        if security not in self.tick_symbols:
+            return None
+        return {"sid": security, "last_price": 10.0, "dt": datetime.now().isoformat()}
 
 
 class DummyBroker(BrokerBase):
@@ -301,7 +610,7 @@ class SequencedV2Client:
         return copy.deepcopy(queue.pop(0))
 
 
-def _build_v2_broker(client: SequencedV2Client) -> AiStocksV2Broker:
+def _build_v2_broker(client: SequencedV2Client) -> Any:
     broker = AiStocksV2Broker(
         V2ClientConfig(
             host="127.0.0.1",
@@ -407,7 +716,24 @@ def every_minute(context):
 
 @pytest.fixture(autouse=True)
 def _isolate_bullet_trade_home(monkeypatch, tmp_path):
+    """
+    隔离 LiveEngine 测试的运行目录和行情 provider。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时目录。
+
+    Returns:
+        None。测试结束后自动恢复环境变量和全局 provider。
+    """
+    from bullet_trade.data import api as data_api
+
+    provider = OfflineLiveProvider()
     monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
+    monkeypatch.setattr(data_api, "_provider", provider, raising=False)
+    monkeypatch.setattr(data_api, "_provider_cache", {provider.name: provider}, raising=False)
+    monkeypatch.setattr(data_api, "_provider_auth_attempted", {provider.name: True}, raising=False)
+    monkeypatch.setattr(data_api, "_auth_attempted", True, raising=False)
 
 
 def test_live_config_defaults_risk_check_to_false(monkeypatch):

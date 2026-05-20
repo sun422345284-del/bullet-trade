@@ -1,15 +1,13 @@
 import asyncio
 import threading
-import time
 
 import pandas as pd
 import pytest
 
 from bullet_trade.broker import RemoteQmtBroker
 from bullet_trade.remote import RemoteQmtConnection
-from bullet_trade.server.adapters import register_adapter
-from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
 from bullet_trade.server.adapters.base import AccountRouter
+from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
 from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
 
@@ -30,11 +28,14 @@ QMT_SERVER_TLS_CERT=/path/to/ca.pem  # 如启用了 TLS
 
 def _ensure_current_event_loop() -> asyncio.AbstractEventLoop:
     try:
-        return asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
 
 
 @pytest.fixture(scope="module")
