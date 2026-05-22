@@ -184,6 +184,27 @@ class BacktestEngine:
             market_cfg.get("market_sell_price_percent", _DEFAULT_MARKET_SELL_PERCENT)
         )
 
+    @staticmethod
+    def _amount_from_value(value: float, price: float) -> int:
+        """把市值按价格换算为股数，并修正浮点数贴近整数时的截断误差。
+
+        Args:
+            value: 需要换算的市值，非正数按 0 股处理。
+            price: 换算价格，非正数按 0 股处理。
+
+        Returns:
+            int: 不超过目标市值的股数；若浮点计算结果极接近整数，则返回该整数。
+        """
+
+        if value <= 0 or price <= 0:
+            return 0
+        raw_amount = float(value) / float(price)
+        nearest_amount = round(raw_amount)
+        tolerance = max(1e-9, abs(raw_amount) * 1e-12)
+        if abs(raw_amount - nearest_amount) <= tolerance:
+            return int(nearest_amount)
+        return int(raw_amount)
+
     def load_strategy(self):
         """加载策略文件或使用传入的函数"""
 
@@ -2186,22 +2207,19 @@ class BacktestEngine:
 
         # 目标价值订单
         if hasattr(order, "_is_target_value") and order._is_target_value:
-            target_value = order._target_value
-            current_value = 0
+            target_value = float(order._target_value)
+            current_amount = 0
             if order.security in self.context.portfolio.positions:
                 position = self.context.portfolio.positions[order.security]
-                current_value = position.total_amount * current_price
+                current_amount = int(position.total_amount)
 
-            diff_value = target_value - current_value
-            return int(diff_value / current_price)
+            target_amount = self._amount_from_value(target_value, current_price)
+            return target_amount - current_amount
 
         # 按价值订单
         if hasattr(order, "_target_value"):
-            return (
-                int(order._target_value / current_price)
-                if order.is_buy
-                else -int(order._target_value / current_price)
-            )
+            amount = self._amount_from_value(float(order._target_value), current_price)
+            return amount if order.is_buy else -amount
 
         return order.amount if order.is_buy else -order.amount
 

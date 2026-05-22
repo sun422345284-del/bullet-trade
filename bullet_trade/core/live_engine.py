@@ -245,6 +245,27 @@ class LiveEngine:
         self._runtime_lock: Optional[ManagedLiveLock] = None
         self._instance_lock: Optional[ManagedLiveLock] = None
 
+    @staticmethod
+    def _amount_from_value(value: float, price: float) -> int:
+        """把市值按价格换算为股数，并修正浮点数贴近整数时的截断误差。
+
+        Args:
+            value: 需要换算的市值，非正数按 0 股处理。
+            price: 换算价格，非正数按 0 股处理。
+
+        Returns:
+            int: 不超过目标市值的股数；若浮点计算结果极接近整数，则返回该整数。
+        """
+
+        if value <= 0 or price <= 0:
+            return 0
+        raw_amount = float(value) / float(price)
+        nearest_amount = round(raw_amount)
+        tolerance = max(1e-9, abs(raw_amount) * 1e-12)
+        if abs(raw_amount - nearest_amount) <= tolerance:
+            return int(nearest_amount)
+        return int(raw_amount)
+
     # ------------------------------------------------------------------
     # 公共入口
     # ------------------------------------------------------------------
@@ -1675,14 +1696,13 @@ class LiveEngine:
         if getattr(order, "_is_target_value", False):
             target_value = float(getattr(order, "_target_value", 0.0))
             current_amount = self._get_position_amount(order.security)
-            current_value = current_amount * price
-            delta_value = target_value - current_value
-            amount = int(abs(delta_value) / price)
-            return amount, delta_value > 0
+            target_amount = self._amount_from_value(target_value, price)
+            delta_amount = target_amount - current_amount
+            return abs(delta_amount), delta_amount > 0
 
         if hasattr(order, "_target_value") and not getattr(order, "_is_target_value", False):
             target_value = float(getattr(order, "_target_value", 0.0))
-            amount = int(abs(target_value) / price)
+            amount = self._amount_from_value(abs(target_value), price)
             return amount, bool(order.is_buy)
 
         amount = int(order.amount or 0)
