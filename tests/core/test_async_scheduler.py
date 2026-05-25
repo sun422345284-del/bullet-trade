@@ -52,3 +52,17 @@ async def test_async_scheduler_runs_all_tasks_in_same_minute(monkeypatch):
     await scheduler.trigger(current_dt, context, is_bar=is_bar)
 
     assert fired == ['bar', 'explicit']
+
+
+def test_async_backtest_engine_daily_frequency_every_bar_is_trading_minute():
+    """异步回测的 every_bar 判定不应因日频回测退化为开盘一次。"""
+    periods = [(dt.time(9, 30), dt.time(11, 30)), (dt.time(13, 0), dt.time(15, 0))]
+    trade_day = dt.date(2025, 1, 3)
+    open_dt = dt.datetime.combine(trade_day, periods[0][0])
+
+    engine = AsyncBacktestEngine()
+    engine.frequency = 'daily'
+
+    assert engine._is_bar_time(dt.datetime(2025, 1, 3, 9, 34), periods, open_dt)
+    assert engine._is_bar_time(dt.datetime(2025, 1, 3, 14, 59), periods, open_dt)
+    assert not engine._is_bar_time(dt.datetime(2025, 1, 3, 11, 30), periods, open_dt)

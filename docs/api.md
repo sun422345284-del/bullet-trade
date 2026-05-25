@@ -34,11 +34,11 @@
 
 ## 调度与时间表达式 {#schedule}
 支持与聚宽一致的定时接口，时间表达式已扩展了常用别名：
-- `run_daily(func, time='every_bar')`：日调度。`every_bar` 在分钟回测每分钟执行，在日回测只在开盘触发；`every_minute` 强制每分钟；`'HH:MM'`/`'HH:MM:SS'` 为指定时刻；相对表达式 `open`/`open-30m`/`close+10s`；内置别名 `before_open=open-30m`、`after_close=close+30m`、`morning=08:00`、`night=20:00`。
+- `run_daily(func, time='every_bar')`：日调度。`every_bar` 在回测与实盘中都按交易时段每分钟 bar 触发；`every_minute` 与其等价且语义更直白；`'HH:MM'`/`'HH:MM:SS'` 为指定时刻；相对表达式 `open`/`open-30m`/`close+10s`；内置别名 `before_open=open-30m`、`after_close=close+30m`、`morning=08:00`、`night=20:00`。
 - `run_weekly(func, weekday, time='09:30', reference_security=None, force=True)`：`weekday` 表示当周第 N 个交易日（支持负数，-1 为最后一个交易日）；`force=True` 时以回测/策略起始日为第 1 个交易日补跑首周，`force=False` 则从自然周第一个交易日起算，过期不补；`reference_security` 影响交易日/交易时段判定。
 - `run_monthly(func, monthday, time='09:30', reference_security=None, force=True)`：`monthday` 表示当月第 N 个交易日（支持负数，-1 为最后一个交易日）；`force=True` 超界时就近取当月最后一个交易日，`force=False` 则跳过。
 - `unschedule_all()`：清空所有已注册任务。
-- 差异提示：`every_bar` 在日频回测只触发一次（开盘），与聚宽相同；我们额外允许通过 `.env` 或 `set_option('time_aliases', {...})` 覆写别名。
+- 差异提示：为保持回测与实盘一致，`every_bar` 不再随回测 `frequency` 退化为每天一次；如只希望每天执行一次，请使用 `time='open'` 或具体时刻。我们额外允许通过 `.env` 或 `set_option('time_aliases', {...})` 覆写别名。
 
 ## 风控与设置 {#risk-settings}
 - `set_benchmark(security)`：设置基准标的（如 `000300.XSHG`），用于报告与回测对比。

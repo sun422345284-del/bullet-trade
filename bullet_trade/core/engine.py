@@ -265,6 +265,28 @@ class BacktestEngine:
             log.error(f"加载策略失败: {e}")
             raise
 
+    @staticmethod
+    def _is_daily_backtest_frequency(frequency: Any) -> bool:
+        """判断回测频率是否属于日频写法。"""
+        normalized = str(frequency or "day").strip().lower()
+        return normalized in {"day", "daily", "1d", "1day", "d"}
+
+    def _warn_every_bar_minute_semantics(self, tasks: Sequence[Any]) -> None:
+        """在日频回测注册 every_bar 时提示分钟级触发语义。"""
+        if not self._is_daily_backtest_frequency(self.frequency):
+            return
+        has_every_bar = any(
+            str(getattr(task, "time", "")).strip().lower() == "every_bar" for task in tasks
+        )
+        if not has_every_bar:
+            return
+        log.warning(
+            '检测到 run_daily(..., time="every_bar")，为保持回测与实盘一致，'
+            "当前回测会按交易时段每分钟触发。"
+            '如只希望每天执行一次，请改用 time="open" 或具体时间；'
+            '如希望语义更直白，可使用 time="every_minute"。'
+        )
+
     def _inject_globals(self, module):
         """向策略模块注入全局变量和函数"""
         import datetime as _datetime
@@ -737,6 +759,7 @@ class BacktestEngine:
         # 避免重复：若 before_market_open/market_open 已通过调度注册，则取消直接调用
         try:
             tasks = get_tasks()
+            self._warn_every_bar_minute_semantics(tasks)
             if self.before_trading_start_func and any(
                 t.func is self.before_trading_start_func for t in tasks
             ):

@@ -172,6 +172,31 @@ def test_backtest_engine_daily_time_expressions(monkeypatch):
     assert minute_info["mid_last"].time() == dt.time(11, 29)
 
 
+def test_backtest_engine_warns_daily_every_bar_runs_every_minute(monkeypatch, caplog):
+    """日频回测注册 every_bar 时应提示分钟级触发语义并按分钟执行。"""
+    trade_day = "2024-06-17"
+    _patch_provider(monkeypatch, [trade_day])
+    hits: list[dt.datetime] = []
+
+    def initialize(context):
+        run_daily(lambda ctx: hits.append(ctx.current_dt), "every_bar")
+
+    caplog.set_level(logging.WARNING, logger="jq_strategy")
+    engine = BacktestEngine(initialize=initialize)
+    engine.run(
+        start_date=trade_day,
+        end_date=trade_day,
+        capital_base=100000,
+        frequency="daily",
+    )
+
+    assert len(hits) == 240
+    assert hits[0].time() == dt.time(9, 30)
+    assert hits[-1].time() == dt.time(14, 59)
+    assert "检测到 run_daily(..., time=\"every_bar\")" in caplog.text
+    assert "如只希望每天执行一次，请改用 time=\"open\" 或具体时间" in caplog.text
+
+
 def test_backtest_engine_weekly_and_monthly(monkeypatch):
     trade_days = ["2024-06-12", "2024-06-13", "2024-06-14", "2024-06-17"]
     _patch_provider(monkeypatch, trade_days)

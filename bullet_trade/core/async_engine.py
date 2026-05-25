@@ -115,6 +115,7 @@ class AsyncBacktestEngine(BacktestEngine):
         tasks = get_tasks()
         if not tasks:
             return
+        self._warn_every_bar_minute_semantics(tasks)
         
         log.info(f"迁移 {len(tasks)} 个调度任务到异步调度器")
         
@@ -390,18 +391,15 @@ class AsyncBacktestEngine(BacktestEngine):
     def _is_bar_time(self, current_dt: datetime, market_periods: Sequence[Tuple[Time, Time]], open_dt: datetime) -> bool:
         """
         判断当前时间是否应视为一个 bar 触发点：
-        - 分钟频率：交易时段内的每个整分
-        - 其他频率：仅在开盘触发
+        - 回测和实盘保持一致，交易时段内的每个整分都是 bar
         """
-        if str(getattr(self, "frequency", "day")).lower() == "minute":
-            if current_dt.second != 0:
-                return False
-            current_time = current_dt.time()
-            for start, end in market_periods:
-                if start <= current_time < end:
-                    return True
+        if current_dt.second != 0:
             return False
-        return current_dt == open_dt
+        current_time = current_dt.time()
+        for start, end in market_periods:
+            if start <= current_time < end:
+                return True
+        return False
     
     async def _process_trading_day(self, trade_day: datetime, day_index: int, total_days: int):
         """

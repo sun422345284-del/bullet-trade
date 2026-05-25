@@ -312,7 +312,7 @@ class AsyncScheduler:
         Args:
             func: 要执行的函数（同步或异步）
             time: 执行时间
-                - 'every_bar': 每个bar（推荐用于分钟策略）
+                - 'every_bar': 每个交易分钟 bar，与实盘和同步回测语义一致
                 - 'open': 开盘时
                 - 'close': 收盘时
                 - 'HH:MM': 特定时间，如 '09:30', '14:00'

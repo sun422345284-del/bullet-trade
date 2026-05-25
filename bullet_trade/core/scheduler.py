@@ -213,20 +213,11 @@ class TimeExpression:
         return result
 
     def _resolve_every_bar(self, target_date: date, market_periods: Sequence[Tuple[Time, Time]]) -> List[datetime]:
-        """解析 every_bar：根据回测频率返回时间点列表。
-        
-        - frequency=minute: 返回当日所有交易分钟（等价于 every_minute）
-        - frequency=day 或其他: 返回开盘时刻
+        """解析 every_bar，返回交易时段内的所有分钟 bar。
+
+        every_bar 与 every_minute 保持一致，使回测和实盘策略调度语义相同。
         """
-        settings = get_settings()
-        frequency = settings.options.get('backtest_frequency', 'day')
-        
-        if frequency == 'minute':
-            # 分钟回测：返回所有交易分钟
-            return self._resolve_every_minute(target_date, market_periods)
-        else:
-            # 日回测或其他：返回开盘时刻
-            return [datetime.combine(target_date, market_periods[0][0])]
+        return self._resolve_every_minute(target_date, market_periods)
 
     @classmethod
     def _parse_offset(cls, value: str) -> timedelta:
@@ -343,9 +334,8 @@ def run_daily(func: Callable, time: str = 'every_bar'):
     Args:
         func: 要执行的函数
         time: 执行时间
-            - 'every_bar': 每个bar触发。在分钟回测（frequency=minute）时每分钟触发一次，
-                          在日回测（frequency=day）时每天触发一次（开盘时刻）
-            - 'every_minute': 每分钟触发一次（不受频率影响）
+            - 'every_bar': 每个交易分钟 bar 触发，回测与实盘语义一致
+            - 'every_minute': 每分钟触发一次，与 every_bar 等价
             - 'HH:MM': 特定时间，如 '09:30', '14:00'
     """
     aliases = _effective_aliases()
