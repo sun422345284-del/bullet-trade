@@ -1653,13 +1653,20 @@ class LiveEngine:
         if isinstance(style_obj, LimitOrderStyle):
             is_market = False
         elif isinstance(style_obj, MarketOrderStyle):
-            is_market = style_obj.limit_price is None
+            is_market = True
         else:
             is_market = True
         if isinstance(style_obj, LimitOrderStyle):
             exec_price = float(style_obj.price)
         elif isinstance(style_obj, MarketOrderStyle) and style_obj.limit_price is not None:
-            exec_price = float(style_obj.limit_price)
+            exec_price = pricing.clamp_price_to_trade_bounds(
+                order.security,
+                float(style_obj.limit_price),
+                last_price,
+                getattr(snapshot, "high_limit", None),
+                getattr(snapshot, "low_limit", None),
+                is_buy,
+            )
         else:
             percent = self._resolve_price_percent(style_obj, is_buy)
             try:

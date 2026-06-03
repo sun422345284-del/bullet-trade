@@ -73,8 +73,8 @@
 
 ## 订单与组合 {#orders-portfolio}
 - 下单/撤单函数（与聚宽同名）：  
-  - `order(security, amount, price=None, style=None, wait_timeout=None)`：按股数下单；`amount>0` 买入，`<0` 卖出；`style=LimitOrderStyle(price)` 显式限价；仅传 `price` 默认视为市价单带保护价（`MarketOrderStyle(limit_price=price)`）。  
-  - `order_value(security, value, price=None, style=None, wait_timeout=None)`：按金额下单，数量在撮合时根据价差计算；传 `price` 同样默认市价+保护价，限价需用 `LimitOrderStyle`。  
+  - `order(security, amount, price=None, style=None, wait_timeout=None)`：按股数下单；`amount>0` 买入，`<0` 卖出；仅传 `price` 或 `style=LimitOrderStyle(price)` 都表示显式限价单；市价保护单需显式使用 `MarketOrderStyle(limit_price=price)`。  
+  - `order_value(security, value, price=None, style=None, wait_timeout=None)`：按金额下单，数量在撮合时根据价格计算；传 `price` 同样表示限价单。  
   - `order_target(security, amount, price=None, style=None, wait_timeout=None)`：将持仓调整到目标股数；价格参数同上。  
   - `order_target_value(security, value, price=None, style=None, wait_timeout=None)`：将持仓调整到目标市值；价格参数同上。
   - `cancel_order(order_or_id)`：撤单；若订单仍在本地队列直接移除，否则尝试用券商订单号撤券商。
@@ -94,7 +94,7 @@
   - `get_trades(order_id=None, security=None)`：返回当日成交字典，`key=trade_id`，`value=Trade` 快照；一个订单可对应多笔成交。  
   - 默认 `set_option('order_match_mode', 'immediate')` 时创建即撮合；否则在 bar 结束批量撮合。
 - 价格样式：`MarketOrderStyle(limit_price=None, buy_price_percent=None, sell_price_percent=None)`（市价，可选保护价或价差系数，实盘会带保护价并传 `market=True`）；`LimitOrderStyle(price)`（限价）。
-- 回测撮合：无论市价/限价，成交价按滑点优先级应用（`ref` > `type` > `all` > 旧全局设置 > `security_overrides`/默认 0.00246/2）；保护价/限价仅用于资金检查和接受条件，不直接决定成交价；货币基金强制 0 滑点。
+- 回测撮合：先用当前 bar 价格判断限价/保护价是否可成交，再按滑点优先级应用（`ref` > `type` > `all` > 旧全局设置 > `security_overrides`/默认 0.00246/2）；最终成交价会被限价/保护价、涨跌停与价格笼子共同约束；货币基金强制 0 滑点。
 - 成本/滑点：`OrderCost`、`FixedSlippage` 同上。
 
 <a id="tick-subscription"></a>

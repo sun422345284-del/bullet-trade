@@ -167,8 +167,8 @@ def order(
     if style is not None:
         resolved_style: object = style
     elif price is not None:
-        # 未显式传入限价风格时，按市价单带保护价处理
-        resolved_style = MarketOrderStyle(limit_price=price)
+        # 与聚宽语义保持一致：price 参数表示显式限价。
+        resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
 
@@ -296,7 +296,7 @@ def order_value(
     if style is not None:
         resolved_style: object = style
     elif price is not None:
-        resolved_style = MarketOrderStyle(limit_price=price)
+        resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
 
@@ -354,7 +354,7 @@ def order_target(
     if style is not None:
         resolved_style: object = style
     elif price is not None:
-        resolved_style = MarketOrderStyle(limit_price=price)
+        resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
 
@@ -412,7 +412,7 @@ def order_target_value(
     if style is not None:
         resolved_style: object = style
     elif price is not None:
-        resolved_style = MarketOrderStyle(limit_price=price)
+        resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
 

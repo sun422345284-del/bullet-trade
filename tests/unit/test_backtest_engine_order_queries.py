@@ -5,8 +5,24 @@ import pandas as pd
 import pytest
 
 from bullet_trade.core.engine import BacktestEngine
-from bullet_trade.core.models import Context, Order, OrderStatus, Portfolio, Position, SecurityUnitData, Trade
-from bullet_trade.core.orders import clear_order_queue, order
+from bullet_trade.core.models import (
+    Context,
+    Order,
+    OrderStatus,
+    Portfolio,
+    Position,
+    SecurityUnitData,
+    Trade,
+)
+from bullet_trade.core.orders import (
+    LimitOrderStyle,
+    MarketOrderStyle,
+    clear_order_queue,
+    order,
+    order_target,
+    order_target_value,
+    order_value,
+)
 from bullet_trade.utils.strategy_helpers import _position_rows
 
 
@@ -16,6 +32,59 @@ def _dummy_initialize(context):
 
 def _dummy_handle_data(context, data):
     return None
+
+
+def _build_order_engine(
+    monkeypatch,
+    *,
+    security="000001.XSHE",
+    current_price=10.0,
+    slippage_price=None,
+    high_limit=11.0,
+    low_limit=9.0,
+    cash=100000.0,
+):
+    """构造最小回测订单撮合环境。"""
+    engine = BacktestEngine(initialize=_dummy_initialize, handle_data=_dummy_handle_data)
+    engine.context = Context(
+        portfolio=Portfolio(
+            total_value=cash,
+            available_cash=cash,
+            transferable_cash=cash,
+            starting_cash=cash,
+        ),
+        current_dt=datetime.datetime(2024, 1, 2, 10, 0, 0),
+    )
+    engine.start_total_value = cash
+
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "bullet_trade.data.api.get_current_data",
+        lambda: {
+            security: SecurityUnitData(
+                security=security,
+                last_price=current_price,
+                high_limit=high_limit,
+                low_limit=low_limit,
+                paused=False,
+            )
+        },
+    )
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _security: {})
+    monkeypatch.setattr(
+        engine, "_resolve_base_exec_price", lambda _security, _dt, _fq: current_price
+    )
+    monkeypatch.setattr(
+        engine,
+        "_apply_slippage_price",
+        lambda price, _is_buy, _security: slippage_price if slippage_price is not None else price,
+    )
+    monkeypatch.setattr(engine, "_infer_security_category", lambda _security, info=None: "stock")
+    monkeypatch.setattr(engine, "_infer_tplus_from_info", lambda info: 0)
+    clear_order_queue()
+    return engine
 
 
 def test_backtest_engine_order_trade_queries():
@@ -49,6 +118,25 @@ def test_backtest_engine_order_trade_queries():
     assert "t1" in trades
 
 
+def test_price_argument_creates_limit_order_style_for_order_helpers(monkeypatch):
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
+    )
+    clear_order_queue()
+    try:
+        orders = [
+            order("000001.XSHE", 100, price=10.5),
+            order_value("000001.XSHE", 5000, price=10.5),
+            order_target("000001.XSHE", 200, price=10.5),
+            order_target_value("000001.XSHE", 8000, price=10.5),
+        ]
+        assert all(local_order is not None for local_order in orders)
+        assert all(isinstance(local_order.style, LimitOrderStyle) for local_order in orders)
+        assert all(local_order.extra["requested_order_price"] == 10.5 for local_order in orders)
+    finally:
+        clear_order_queue()
+
+
 def test_backtest_order_records_requested_and_fill_price(monkeypatch):
     engine = BacktestEngine(initialize=_dummy_initialize, handle_data=_dummy_handle_data)
     engine.context = Context(
@@ -62,7 +150,9 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
     )
     engine.start_total_value = 100000.0
 
-    monkeypatch.setattr("bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         "bullet_trade.data.api.get_current_data",
         lambda: {
@@ -76,7 +166,9 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
         },
     )
     monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda security: {})
-    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda security, current_dt, fq_mode: 10.0)
+    monkeypatch.setattr(
+        engine, "_resolve_base_exec_price", lambda security, current_dt, fq_mode: 10.0
+    )
     monkeypatch.setattr(engine, "_apply_slippage_price", lambda price, is_buy, security: 10.2)
     monkeypatch.setattr(engine, "_infer_security_category", lambda security, info=None: "stock")
     monkeypatch.setattr(engine, "_infer_tplus_from_info", lambda info: 0)
@@ -84,6 +176,7 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
     clear_order_queue()
     local_order = order("000001.XSHE", 100, price=10.5)
     assert local_order is not None
+    assert isinstance(local_order.style, LimitOrderStyle)
     assert local_order.extra["order_price"] == 10.5
     assert local_order.extra["requested_order_price"] == 10.5
 
@@ -91,12 +184,96 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
 
     assert local_order.status == OrderStatus.filled
     assert local_order.price == 10.2
-    assert local_order.extra["order_price"] == 10.5
+    assert local_order.extra["order_price"] == 10.2
     assert local_order.extra["requested_order_price"] == 10.5
     assert local_order.extra["fill_price"] == 10.2
     position = engine.context.portfolio.positions["000001.XSHE"]
     assert position.buy_time == engine.context.current_dt
     assert position.last_buy_time == engine.context.current_dt
+    clear_order_queue()
+
+
+def test_backtest_limit_buy_fills_when_slippage_reaches_limit(monkeypatch):
+    engine = _build_order_engine(
+        monkeypatch,
+        security="300394.XSHE",
+        current_price=81.71,
+        slippage_price=81.75,
+        high_limit=98.0,
+        low_limit=65.0,
+        cash=300000.0,
+    )
+
+    local_order = order("300394.XSHE", 2400, price=81.75)
+    assert local_order is not None
+    assert isinstance(local_order.style, LimitOrderStyle)
+
+    engine._process_orders(engine.context.current_dt)
+
+    assert local_order.status == OrderStatus.filled
+    assert local_order.price == pytest.approx(81.75)
+    assert engine.trades[-1].price == pytest.approx(81.75)
+    clear_order_queue()
+
+
+def test_backtest_limit_buy_caps_slippage_at_limit(monkeypatch):
+    engine = _build_order_engine(
+        monkeypatch,
+        current_price=81.71,
+        slippage_price=81.8,
+        high_limit=98.0,
+        low_limit=65.0,
+        cash=300000.0,
+    )
+
+    local_order = order("000001.XSHE", 100, price=81.75)
+    assert local_order is not None
+
+    engine._process_orders(engine.context.current_dt)
+
+    assert local_order.status == OrderStatus.filled
+    assert local_order.price == pytest.approx(81.75)
+    assert engine.trades[-1].price == pytest.approx(81.75)
+    clear_order_queue()
+
+
+def test_backtest_market_protect_order_caps_slippage_at_protect_price(monkeypatch):
+    engine = _build_order_engine(
+        monkeypatch,
+        current_price=10.0,
+        slippage_price=10.25,
+        high_limit=11.0,
+        low_limit=9.0,
+    )
+
+    local_order = order("000001.XSHE", 100, style=MarketOrderStyle(limit_price=10.12))
+    assert local_order is not None
+
+    engine._process_orders(engine.context.current_dt)
+
+    assert local_order.status == OrderStatus.filled
+    assert local_order.price == pytest.approx(10.12)
+    assert engine.trades[-1].price == pytest.approx(10.12)
+    clear_order_queue()
+
+
+def test_backtest_limit_buy_not_filled_when_bar_price_above_limit(monkeypatch):
+    engine = _build_order_engine(
+        monkeypatch,
+        current_price=10.2,
+        slippage_price=10.2,
+        high_limit=11.0,
+        low_limit=9.0,
+    )
+
+    local_order = order("000001.XSHE", 100, price=10.1)
+    assert local_order is not None
+
+    engine._process_orders(engine.context.current_dt)
+
+    assert local_order.status == OrderStatus.canceled
+    assert engine.trades == []
+    assert "000001.XSHE" not in engine.context.portfolio.positions
     clear_order_queue()
 
 

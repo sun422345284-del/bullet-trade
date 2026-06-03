@@ -9,6 +9,7 @@ from bullet_trade.core.event_bus import EventBus
 from bullet_trade.core.live_engine import LiveEngine
 from bullet_trade.core.models import Position
 from bullet_trade.core.orders import (
+    MarketOrderStyle,
     clear_order_queue,
     order,
     order_target,
@@ -143,3 +144,51 @@ async def test_local_live_market_helpers_compute_directional_protect_prices(monk
         "buy",
         "sell",
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_live_market_style_with_limit_price_stays_market_order(monkeypatch, tmp_path):
+    engine = LiveEngine(
+        strategy_file=_write_strategy(tmp_path),
+        broker_factory=_RecordingBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = _RecordingBroker()
+    engine.context.portfolio.available_cash = 1_000_000
+    engine.context.portfolio.total_value = 1_000_000
+    engine._risk = None
+
+    class Snap:
+        paused = False
+        last_price = 10.0
+        high_limit = 11.0
+        low_limit = 9.0
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data",
+        lambda: {"000001.XSHE": Snap()},
+    )
+
+    clear_order_queue()
+    set_current_engine(engine)
+    try:
+        order("000001.XSHE", 100, style=MarketOrderStyle(limit_price=10.5))
+        await engine._process_orders(engine.context.current_dt)
+    finally:
+        set_current_engine(None)
+        clear_order_queue()
+
+    assert engine.broker.orders == [("000001.XSHE", 100, 10.2, "buy", True)]

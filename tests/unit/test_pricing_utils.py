@@ -43,6 +43,28 @@ def test_compute_market_protect_price_clamped_by_cage():
     _assert_close(price, 10.2)
 
 
+def test_clamp_price_to_trade_bounds_uses_limit_and_price_cage():
+    buy_price = pricing.clamp_price_to_trade_bounds(
+        "600000.XSHG",
+        10.5,
+        10.0,
+        10.15,
+        9.0,
+        True,
+    )
+    _assert_close(buy_price, 10.15)
+
+    sell_price = pricing.clamp_price_to_trade_bounds(
+        "600000.XSHG",
+        9.5,
+        10.0,
+        11.0,
+        9.85,
+        False,
+    )
+    _assert_close(sell_price, 9.85)
+
+
 def test_resolve_market_percent_priority():
     cfg_buy = 0.015
     cfg_sell = -0.015

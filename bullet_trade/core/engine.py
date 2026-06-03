@@ -1864,12 +1864,22 @@ class BacktestEngine:
                 is_buy = amount > 0
                 intended_amount = abs(amount)
 
+                # 根据证券分类确定价格精度：stock=2位小数，fund/money_market_fund=3位小数
+                price_decimals = 2 if security_category == "stock" else 3
+                price_reference = (
+                    float(security_data.last_price)
+                    if getattr(security_data, "last_price", 0.0) and security_data.last_price > 0
+                    else current_price
+                )
+
                 style_obj = getattr(order, "style", None)
                 trade_price: Optional[float] = None
                 limit_price: Optional[float] = None
+                price_label = "限价"
                 if isinstance(style_obj, LimitOrderStyle):
                     limit_price = float(style_obj.price)
                 elif isinstance(style_obj, MarketOrderStyle):
+                    price_label = "保护价"
                     if style_obj.limit_price is not None:
                         limit_price = float(style_obj.limit_price)
                     else:
@@ -1891,6 +1901,27 @@ class BacktestEngine:
                         except Exception as exc:
                             log.debug(f"未能计算市价保护价 {order.security}: {exc}")
 
+                if limit_price is not None:
+                    requested_limit_price = float(limit_price)
+                    try:
+                        limit_price = pricing.clamp_price_to_trade_bounds(
+                            order.security,
+                            requested_limit_price,
+                            price_reference,
+                            getattr(security_data, "high_limit", None),
+                            getattr(security_data, "low_limit", None),
+                            is_buy,
+                        )
+                        if abs(limit_price - requested_limit_price) > 1e-9:
+                            action_label = "买入" if is_buy else "卖出"
+                            log.info(
+                                f"{order.security} {action_label}{price_label} "
+                                f"{requested_limit_price:.{price_decimals}f} 超出涨跌停/价格笼子，"
+                                f"调整为 {limit_price:.{price_decimals}f}"
+                            )
+                    except Exception as exc:
+                        log.debug(f"{order.security} {price_label}边界裁剪失败: {exc}")
+
                 if trade_price is None:
                     info = get_security_info(order.security)
                     category = self._infer_security_category(order.security, info)
@@ -1903,29 +1934,38 @@ class BacktestEngine:
 
                 trade_price = self._round_to_tick(trade_price, order.security, is_buy=None)
 
-                # 根据证券分类确定价格精度：stock=2位小数，fund/money_market_fund=3位小数
-                price_decimals = 2 if security_category == "stock" else 3
-
                 if limit_price is not None:
-                    if is_buy and trade_price - limit_price > 1e-9:
+                    if is_buy and current_price - limit_price > 1e-9:
                         log.info(
-                            f"{order.security} 撮合价 {trade_price:.{price_decimals}f} 超出买入限价 {limit_price:.{price_decimals}f}，取消订单"
+                            f"{order.security} 当前价 {current_price:.{price_decimals}f} "
+                            f"高于买入{price_label} {limit_price:.{price_decimals}f}，订单未成交"
                         )
                         order.status = OrderStatus.canceled
                         continue
-                    if (not is_buy) and limit_price - trade_price > 1e-9:
+                    if (not is_buy) and limit_price - current_price > 1e-9:
                         log.info(
-                            f"{order.security} 撮合价 {trade_price:.{price_decimals}f} 低于卖出限价 {limit_price:.{price_decimals}f}，取消订单"
+                            f"{order.security} 当前价 {current_price:.{price_decimals}f} "
+                            f"低于卖出{price_label} {limit_price:.{price_decimals}f}，订单未成交"
                         )
                         order.status = OrderStatus.canceled
                         continue
-                if (
-                    isinstance(style_obj, MarketOrderStyle)
-                    and limit_price is not None
-                    and security_category == "stock"
-                ):
-                    # 市价单的保护价仅用于限价保护与资金检查，成交价仍按滑点撮合
-                    pass
+                    if is_buy:
+                        trade_price = min(trade_price, limit_price)
+                    else:
+                        trade_price = max(trade_price, limit_price)
+
+                try:
+                    trade_price = pricing.clamp_price_to_trade_bounds(
+                        order.security,
+                        trade_price,
+                        price_reference,
+                        getattr(security_data, "high_limit", None),
+                        getattr(security_data, "low_limit", None),
+                        is_buy,
+                    )
+                except Exception as exc:
+                    log.debug(f"{order.security} 成交价边界裁剪失败: {exc}")
+                trade_price = self._round_to_tick(trade_price, order.security, is_buy=None)
 
                 # 买入前资金检查：按“可下单量上限”缩量 + 一手取整 + 最小申报量
                 final_amount = intended_amount
