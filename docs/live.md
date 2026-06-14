@@ -113,12 +113,49 @@ QMT_SERVER_ACCOUNT_KEY=main
 | `.env` 设置 `TRADE_MAX_WAIT_TIME` | 全局生效，默认 `16`；设 `0` 为纯异步 |
 | 函数参数 `wait_timeout=10` | 单次下单覆盖，优先级高于环境变量 |
 
+`TRADE_MAX_WAIT_TIME` / `wait_timeout` 是订单终态等待窗口，不是网络请求超时。远程 `qmt-remote` 默认使用 `QMT_SERVER_RPC_TIMEOUT=60`，并在下单时保证请求超时大于 `wait_timeout + QMT_PLACE_ORDER_TIMEOUT_MARGIN`，避免订单已提交但客户端先报 RPC 超时。长连接 `RemoteQmtBroker` 如果显式配置了默认等待窗口，会把同一个等待值传给 server 并用于 RPC timeout 预算；如果没有配置，则保持旧行为，由 server 端使用自己的默认等待设置。
+
+server session 的外层请求超时默认也是 60 秒；当 `broker.place_order` 显式传入更长 `wait_timeout` 时，会自动扩展到 `wait_timeout + 30s`，避免 server 外层先于订单等待窗口超时。
+
 策略中批量异步下单示例：
 
 ```python
 order_target('000001.XSHE', 0, wait_timeout=0)   # 立即返回
 order('600519.XSHG', 100, wait_timeout=10)         # 等 10 秒
 ```
+
+### 远程下单兼容性与升级边界
+
+本次远程 QMT 下单语义保持向后兼容：
+
+- `buy` / `sell` / `order` 正常提交后仍返回订单号字符串，旧策略不需要改成读取新对象。
+- `broker.place_order` 响应只新增可选字段，例如 `timed_out`、`async_tracking`、`last_snapshot`、`sub_account_id`，旧客户端可以忽略。
+- `broker.orders` / `broker.trades` 仍返回原有 list/dict 结构；新字段只用于排查和上层系统认领迟到订单。
+- 新 helper 连接旧 server 时，缺少这些新增字段也能运行；旧 helper 连接新 server 时，未知字段不会影响旧字段读取。
+- 若看到 `status=open/submitted` 且 `timed_out=true`，含义是“委托已提交但等待终态超时”，不是下单失败；后续应通过订单/成交查询确认最终状态。
+- 若客户端网络超时且没有拿到 `order_id`，只能视为 `submit_unknown`，需要后续查订单/成交，不应直接重复下单。
+
+开源用户升级时建议保留默认值：
+
+```env
+QMT_SERVER_RPC_TIMEOUT=60
+QMT_PLACE_ORDER_TIMEOUT_MARGIN=30
+```
+
+聚宽短连接 helper 不读取 `.env`，需要在初始化时传参；不传时也使用相同默认值：
+
+```python
+bt.configure(
+    host="127.0.0.1",
+    token="secret",
+    rpc_timeout=60,
+    place_order_timeout_margin=30,
+)
+```
+
+如果明确希望只按 `wait_timeout` 本身设置请求超时，可以把 `place_order_timeout_margin=0`；该显式 0 值会被保留，不会被默认 30 秒覆盖。
+
+如果显式把 `TRADE_MAX_WAIT_TIME` 调大，也应同步确认 RPC timeout 至少大于 `wait_timeout + margin`。
 
 ## 7. 常见问题
 

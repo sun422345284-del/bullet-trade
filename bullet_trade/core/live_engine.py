@@ -1586,6 +1586,7 @@ class LiveEngine:
     def get_open_orders(self) -> Dict[str, Order]:
         open_states = {
             OrderStatus.new.value,
+            "submitted",
             OrderStatus.open.value,
             OrderStatus.filling.value,
             OrderStatus.canceling.value,

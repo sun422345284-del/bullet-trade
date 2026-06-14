@@ -943,13 +943,23 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             )
 
         if isinstance(order, str):
-            return {
+            response = {
                 "order_id": order,
+                "status": "submitted",
                 "amount": amount,
                 "price": price,
                 "order_price": price,
                 "requested_order_price": price,
             }
+            wait_result_reader = getattr(broker, "get_last_order_wait_result", None)
+            if callable(wait_result_reader):
+                try:
+                    wait_result = wait_result_reader(order)
+                except Exception:
+                    wait_result = None
+                if isinstance(wait_result, dict):
+                    response.update(wait_result)
+            return response
         result = order or {}
         result["amount"] = amount
         result["price"] = price
@@ -1023,7 +1033,15 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             if status:
                 last_snapshot = status
                 st = str(status.get("status") or "").lower()
-                if st in ("filled", "cancelled", "canceled", "partly_canceled", "rejected"):
+                if st in (
+                    "filled",
+                    "cancelled",
+                    "canceled",
+                    "partly_canceled",
+                    "rejected",
+                    "failed",
+                    "error",
+                ):
                     final_snapshot = status
                     break
             await asyncio.sleep(interval)

@@ -19,6 +19,7 @@ class ClientSession:
 
     # 请求超时时间（秒），超过此时间未完成的请求会被取消
     REQUEST_TIMEOUT = 60.0
+    PLACE_ORDER_TIMEOUT_MARGIN = 30.0
 
     def __init__(self, app: "ServerApplication", reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peername: str):
         self.app = app
@@ -92,14 +93,15 @@ class ClientSession:
             self._current_request = action
             start = time.time()
             try:
+                request_timeout = self._request_timeout_for(action, payload)
                 # 使用 asyncio.wait_for 添加超时控制
                 result = await asyncio.wait_for(
                     self.app.handle_request(self, action, payload),
-                    timeout=self.REQUEST_TIMEOUT,
+                    timeout=request_timeout,
                 )
             except asyncio.TimeoutError:
                 elapsed = time.time() - start
-                error_msg = f"请求超时（>{self.REQUEST_TIMEOUT}s）"
+                error_msg = f"请求超时（>{request_timeout}s）"
                 log.warning(f"[SESSION] {self.session_id} 请求 {action} 超时, 耗时={elapsed:.1f}s")
                 self.app.log_access(self, action, payload, "timeout", elapsed, error_msg, request_id=request_id)
                 await self._send_error(request_id, "REQUEST_TIMEOUT", error_msg)
@@ -128,6 +130,33 @@ class ClientSession:
     async def _send_pong(self, ping: Dict[str, Any]) -> None:
         self._last_ping = time.time()
         await self._safe_send({"type": "pong", "id": ping.get("id")})
+
+    def _request_timeout_for(self, action: Optional[str], payload: Dict[str, Any]) -> float:
+        """计算单次请求的 session 层超时。
+
+        Args:
+            action: 客户端请求 action，例如 `broker.place_order`。
+            payload: 客户端请求载荷。
+
+        Returns:
+            float: session 外层 `asyncio.wait_for` 使用的超时秒数。
+
+        业务原因:
+            `broker.place_order` 可能显式传入较长 `wait_timeout` 等待订单终态。
+            session 外层超时必须不小于该业务等待窗口加安全余量，否则会在
+            broker adapter 返回 `open/timed_out` 之前先返回 REQUEST_TIMEOUT。
+        """
+
+        timeout = float(self.REQUEST_TIMEOUT)
+        if str(action or "") != "broker.place_order":
+            return timeout
+        try:
+            wait_timeout = float(payload.get("wait_timeout") or 0.0)
+        except (TypeError, ValueError):
+            wait_timeout = 0.0
+        if wait_timeout <= 0:
+            return timeout
+        return max(timeout, wait_timeout + float(self.PLACE_ORDER_TIMEOUT_MARGIN))
 
     async def send_event(self, event: str, payload: Dict[str, Any]) -> None:
         if not self._active:

@@ -7,15 +7,188 @@ from tests.test_remote_server import stub_server  # 复用 stub server fixture
 class _RecordingClient:
     def __init__(self):
         self.requests = []
+        self.timeouts = []
         self.positions = [{"security": "000001.XSHE", "amount": 300, "closeable_amount": 300}]
 
-    def request(self, action, payload):
+    def request(self, action, payload, timeout=None):
         self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
         if action == "broker.positions":
             return self.positions
         if action == "broker.order_status":
             return {"order_id": payload.get("order_id"), "status": "filled"}
         return {"order_id": "oid-1", "status": "open", "amount": payload.get("amount"), "price": 10.0}
+
+
+class _TimedOutClient(_RecordingClient):
+    def request(self, action, payload, timeout=None):
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        return {
+            "order_id": "oid-timeout",
+            "status": "open",
+            "amount": payload.get("amount"),
+            "price": 10.0,
+            "timed_out": True,
+            "async_tracking": True,
+            "last_snapshot": {"order_id": "oid-timeout", "status": "open"},
+        }
+
+
+class _FailureStatusClient(_RecordingClient):
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
+
+    def request(self, action, payload, timeout=None):
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        return {
+            "order_id": "oid-failed",
+            "status": self.status,
+            "amount": payload.get("amount"),
+            "price": 10.0,
+        }
+
+
+class _TimeoutClient(_RecordingClient):
+    """模拟短连接下单响应超时的 helper 测试客户端。"""
+
+    def request(self, action, payload, timeout=None):
+        """抛出无订单号的下单超时异常。
+
+        Args:
+            action: 远程 action 名称。
+            payload: 请求载荷。
+            timeout: 请求超时秒数。
+
+        Returns:
+            None: 本测试桩始终抛异常。
+
+        Raises:
+            RuntimeError: 模拟短连接客户端接收响应超时。
+        """
+
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        raise RuntimeError(f"接收响应超时: timeout={timeout}s")
+
+
+class _WaitFailureClient(_RecordingClient):
+    """模拟下单后等待阶段查询到异常终态的 helper 测试客户端。"""
+
+    def __init__(self, status):
+        """初始化异常终态测试客户端。
+
+        Args:
+            status: 等待阶段返回的订单状态。
+        """
+
+        super().__init__()
+        self.status = status
+        self.status_query_count = 0
+
+    def request(self, action, payload, timeout=None):
+        """返回下单成功和后续异常终态查询。
+
+        Args:
+            action: 远程 action 名称。
+            payload: 请求载荷。
+            timeout: 请求超时秒数。
+
+        Returns:
+            dict: 下单响应或订单状态响应。
+        """
+
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        if action == "broker.order_status":
+            self.status_query_count += 1
+            return {"order_id": payload.get("order_id"), "status": self.status}
+        return {"order_id": "oid-wait-failed", "status": "open", "amount": payload.get("amount"), "price": 10.0}
+
+
+class _OrderQueryClient(_RecordingClient):
+    """提供订单和成交查询响应的 helper 测试客户端。"""
+
+    def request(self, action, payload, timeout=None):
+        """返回带新增字段和未知字段的测试响应。
+
+        Args:
+            action: 远程 action 名称。
+            payload: 请求载荷。
+            timeout: 请求超时秒数。
+
+        Returns:
+            object: helper 可消费的远程响应。
+        """
+
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        if action == "broker.orders":
+            return [
+                {
+                    "order_id": "oid-extra",
+                    "security": "000001.XSHE",
+                    "status": "open",
+                    "amount": 100,
+                    "price": 10.0,
+                    "filled": 0,
+                    "timed_out": True,
+                    "async_tracking": True,
+                    "last_snapshot": {"order_id": "oid-extra", "status": "open"},
+                    "new_server_field": {"ignored": True},
+                }
+            ]
+        if action == "broker.trades":
+            return [
+                {
+                    "trade_id": "trade-extra",
+                    "order_id": "oid-extra",
+                    "security": "000001.XSHE",
+                    "amount": 100,
+                    "price": 10.0,
+                    "new_server_field": "ignored",
+                }
+            ]
+        return super().request(action, payload, timeout=timeout)
+
+
+class _OpenOrdersClient(_RecordingClient):
+    """提供 open order 过滤用订单列表的 helper 测试客户端。"""
+
+    def request(self, action, payload, timeout=None):
+        """返回包含 submitted 和 filled 的订单列表。
+
+        Args:
+            action: 远程 action 名称。
+            payload: 请求载荷。
+            timeout: 请求超时秒数。
+
+        Returns:
+            object: 订单列表或默认响应。
+        """
+
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        if action == "broker.orders":
+            return [
+                {
+                    "order_id": "oid-submitted",
+                    "security": "000001.XSHE",
+                    "status": "submitted",
+                    "amount": 100,
+                    "price": 10.0,
+                },
+                {
+                    "order_id": "oid-filled",
+                    "security": "000001.XSHE",
+                    "status": "filled",
+                    "amount": 100,
+                    "price": 10.0,
+                },
+            ]
+        return super().request(action, payload, timeout=timeout)
 
 
 class _FakeDataClient:
@@ -99,6 +272,124 @@ def test_helper_order_target_value_accepts_value_alias_for_market_sell():
     assert payload["wait_timeout"] == 5
     assert payload["market"] is True
     assert payload["style"] == {"type": "market"}
+    place_order_index = next(
+        idx for idx, item in enumerate(client.requests) if item[0] == "broker.place_order"
+    )
+    assert client.timeouts[place_order_index] == 60.0
+
+
+def test_helper_order_exposes_server_wait_timeout_fields():
+    client = _TimedOutClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    oid = broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=10)
+
+    assert oid == "oid-timeout"
+    assert client.timeouts[0] == 60.0
+    order = broker._place_order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=10)
+    assert order.timed_out is True
+    assert order.async_tracking is True
+    assert order.last_snapshot["status"] == "open"
+
+
+@pytest.mark.parametrize("status", ["submit_unknown", "rejected", "canceled", "failed", "error"])
+def test_helper_order_rejects_failed_or_unknown_status(status):
+    """helper 不得把提交未知或明确失败的响应当成成功订单号。"""
+
+    client = _FailureStatusClient(status)
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    with pytest.raises(RuntimeError):
+        broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=10)
+
+
+def test_helper_order_maps_network_timeout_to_submit_unknown():
+    """helper 网络超时且无订单号时应暴露 submit_unknown 语义。"""
+
+    client = _TimeoutClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    with pytest.raises(RuntimeError, match="submit_unknown"):
+        broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=10)
+
+
+def test_helper_place_order_timeout_margin_is_configurable():
+    """helper 下单 RPC 超时余量应可配置且保持默认兼容。"""
+
+    client = _RecordingClient()
+    client.rpc_timeout = 20.0
+    broker = helper.RemoteBrokerClient(
+        client,
+        account_key="default",
+        place_order_timeout_margin=5.0,
+    )
+
+    broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=40)
+
+    assert client.timeouts[0] == 45.0
+
+
+def test_helper_place_order_timeout_margin_allows_zero():
+    """helper 显式配置 0 秒下单余量时不应被默认 30 秒覆盖。"""
+
+    client = _RecordingClient()
+    client.rpc_timeout = 20.0
+    broker = helper.RemoteBrokerClient(
+        client,
+        account_key="default",
+        place_order_timeout_margin=0.0,
+    )
+
+    broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=40)
+
+    assert client.timeouts[0] == 40.0
+
+
+@pytest.mark.parametrize("status", ["failed", "error"])
+def test_helper_wait_order_stops_on_failed_like_status(status):
+    """helper 等待阶段遇到异常终态时应立即停止轮询。
+
+    Args:
+        status: 等待阶段返回的异常终态。
+    """
+
+    client = _WaitFailureClient(status)
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    oid = broker.order("000001.XSHE", 100, 10.0, "BUY", wait_timeout=5)
+
+    assert oid == "oid-wait-failed"
+    assert client.status_query_count == 1
+
+
+def test_helper_order_queries_ignore_unknown_added_fields():
+    """helper 查询订单/成交时应忽略未知新增字段并保留旧字段。"""
+
+    client = _OrderQueryClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    orders = broker.get_orders(order_id="oid-extra")
+    trades = broker.get_trades(order_id="oid-extra")
+
+    order = orders["oid-extra"]
+    assert order.order_id == "oid-extra"
+    assert order.status == "open"
+    assert order.timed_out is True
+    assert order.async_tracking is True
+    assert order.last_snapshot["status"] == "open"
+    assert trades["trade-extra"].order_id == "oid-extra"
+    assert trades["trade-extra"].security == "000001.XSHE"
+
+
+def test_helper_get_open_orders_includes_submitted():
+    """submitted 状态应被视为 open order，兼容新版 server 已提交未终态响应。"""
+
+    client = _OpenOrdersClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    orders = broker.get_open_orders()
+
+    assert list(orders.keys()) == ["oid-submitted"]
 
 
 def test_helper_order_value_without_price_sends_market_sell_payload():
@@ -186,8 +477,10 @@ def test_helper_e2e_with_stub(stub_server):
         port=stub_server.port,
         token=stub_server.token,
         account_key=stub_server.accounts[0].key if stub_server.accounts else "default",
+        place_order_timeout_margin=12.0,
     )
     assert helper.get_broker_client()._data_client is helper.get_data_client()
+    assert helper.get_broker_client().place_order_timeout_margin == 12.0
     # 账户与持仓
     account = helper.get_account()
     assert account.available_cash == 1_000_000

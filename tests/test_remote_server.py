@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import threading
 
 import pandas as pd
@@ -10,6 +11,7 @@ from bullet_trade.server.adapters.base import AccountRouter
 from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
 from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
+from bullet_trade.server.session import ClientSession
 
 """
 这些测试使用 stub server 验证 RemoteQmtConnection/RemoteQmtBroker 的端到端行为。
@@ -75,6 +77,93 @@ def _make_connection(cfg: ServerConfig) -> RemoteQmtConnection:
     conn = RemoteQmtConnection(cfg.listen, cfg.port, cfg.token)
     conn.start()
     return conn
+
+
+def test_remote_connection_request_cancels_pending_future_on_timeout(monkeypatch):
+    """同步 request 超时时应取消后台协程，避免长连接 pending 状态残留。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._loop = object()  # type: ignore[assignment]
+    conn._connected.set()
+    background_future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def _run_coroutine_threadsafe(coro, _loop):
+        """模拟提交到后台事件循环但永远不返回的 request coroutine。"""
+
+        coro.close()
+        return background_future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
+
+    with pytest.raises(TimeoutError):
+        conn.request("broker.place_order", {}, timeout=0.001)
+
+    assert background_future.cancelled()
+
+
+def test_remote_connection_default_timeout_applies_while_reconnecting(monkeypatch):
+    """省略 timeout 时也应使用默认保护窗口，不能在重连状态无限等待。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token", request_timeout=60)
+    conn.request_timeout = 0.001
+    conn._loop = object()  # type: ignore[assignment]
+    background_future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def _run_coroutine_threadsafe(coro, _loop):
+        """模拟后台协程还在等待连接恢复。"""
+
+        coro.close()
+        return background_future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
+
+    with pytest.raises(TimeoutError):
+        conn.request("broker.place_order", {})
+
+    assert background_future.cancelled()
+
+
+def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
+    """显式 timeout=None 时保留旧版无限等待语义，省略参数才用默认保护窗口。"""
+
+    class _RecordedFuture:
+        def __init__(self):
+            self.timeouts = []
+
+        def result(self, timeout=None):
+            self.timeouts.append(timeout)
+            return {"ok": True}
+
+        def cancel(self):
+            return False
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token", request_timeout=60)
+    conn._loop = object()  # type: ignore[assignment]
+    recorded_future = _RecordedFuture()
+
+    def _run_coroutine_threadsafe(coro, _loop):
+        """记录 request 传给 Future.result 的 timeout 参数。"""
+
+        coro.close()
+        return recorded_future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
+
+    assert conn.request("broker.account", {}) == {"ok": True}
+    assert conn.request("broker.account", {}, timeout=None) == {"ok": True}
+
+    assert recorded_future.timeouts == [60, None]
+
+
+def test_server_session_extends_place_order_timeout_for_long_wait():
+    """broker.place_order 长等待窗口应同步扩展 session 外层请求超时。"""
+
+    session = ClientSession.__new__(ClientSession)
+
+    assert session._request_timeout_for("broker.account", {}) == 60.0
+    assert session._request_timeout_for("broker.place_order", {"wait_timeout": 16}) == 60.0
+    assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 120.0
+    assert session._request_timeout_for("broker.place_order", {"wait_timeout": "bad"}) == 60.0
 
 
 def test_stub_server_history(stub_server):

@@ -106,6 +106,7 @@ class QmtBroker(BrokerBase):
             self._retry_interval = max(1, int(retry_interval)) if retry_interval is not None else 60
         except (TypeError, ValueError):
             self._retry_interval = 60
+        self._last_order_wait_results: Dict[str, Dict[str, Any]] = {}
 
     def _ensure_connected(self):
         if not self._connected:
@@ -336,6 +337,7 @@ class QmtBroker(BrokerBase):
         orders = self.sync_orders()
         open_states = {
             OrderStatus.new.value,
+            "submitted",
             OrderStatus.open.value,
             OrderStatus.filling.value,
             OrderStatus.canceling.value,
@@ -358,6 +360,7 @@ class QmtBroker(BrokerBase):
                     is_buy = self._map_order_side(item.get("order_type"))
                 if is_buy is not None:
                     row["is_buy"] = bool(is_buy)
+                self._attach_order_wait_trace(row, row.get("order_id"))
                 result.append(row)
         return result
 
@@ -404,6 +407,7 @@ class QmtBroker(BrokerBase):
                 is_buy = self._map_order_side(item.get("order_type"))
             if is_buy is not None:
                 row["is_buy"] = bool(is_buy)
+            self._attach_order_wait_trace(row, row.get("order_id"))
             result.append(row)
             _emit_order_debug(
                 "get_orders_row",
@@ -493,6 +497,8 @@ class QmtBroker(BrokerBase):
                 _pick(item, "trade_value"),
                 _pick(item, "amount_value"),
             )
+            order_remark = _first_present(_pick(item, "order_remark"), _pick(item, "remark"))
+            strategy_name = _first_present(_pick(item, "strategy_name"), _pick(item, "strategy"))
             if not trade_id:
                 base = f"{oid}-{trade_time}-{price}-{amount}"
                 trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
@@ -518,21 +524,23 @@ class QmtBroker(BrokerBase):
                 normalized_deal_balance = float(deal_balance or 0.0)
             except Exception:
                 normalized_deal_balance = 0.0
-            result.append(
-                {
-                    "trade_id": str(trade_id),
-                    "order_id": str(oid) if oid is not None else "",
-                    "security": jq_code,
-                    "amount": normalized_amount,
-                    "price": normalized_price,
-                    "traded_price": normalized_price,
-                    "deal_balance": normalized_deal_balance,
-                    "time": trade_time,
-                    "commission": normalized_commission,
-                    "commission_fee": normalized_commission,
-                    "tax": normalized_tax,
-                }
-            )
+            row = {
+                "trade_id": str(trade_id),
+                "order_id": str(oid) if oid is not None else "",
+                "security": jq_code,
+                "amount": normalized_amount,
+                "price": normalized_price,
+                "traded_price": normalized_price,
+                "deal_balance": normalized_deal_balance,
+                "time": trade_time,
+                "commission": normalized_commission,
+                "commission_fee": normalized_commission,
+                "tax": normalized_tax,
+                "order_remark": order_remark,
+                "strategy_name": strategy_name,
+            }
+            self._attach_order_wait_trace(row, oid)
+            result.append(row)
             _emit_order_debug(
                 "get_trades_row",
                 trade_id=str(trade_id),
@@ -741,7 +749,7 @@ class QmtBroker(BrokerBase):
                             order_remark=order_remark,
                             strategy_name=strategy_name,
                         )
-                        return {
+                        row = {
                             "order_id": str(oid),
                             "status": mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
                             "raw_status": status,
@@ -754,6 +762,8 @@ class QmtBroker(BrokerBase):
                             "order_remark": order_remark,
                             "strategy_name": strategy_name,
                         }
+                        self._attach_order_wait_trace(row, oid)
+                        return row
             except Exception:
                 continue
         return {}
@@ -942,17 +952,83 @@ class QmtBroker(BrokerBase):
                 except TypeError:
                     return (security, amount, price, side)
 
-    async def _maybe_wait(self, order_id: str, override_timeout: Optional[float] = None) -> None:
-        """根据 TRADE_MAX_WAIT_TIME 执行同步等待骨架（协程版）"""
+    def get_last_order_wait_result(self, order_id: str) -> Dict[str, Any]:
+        """读取最近一次下单等待结果。
+
+        Args:
+            order_id: 远端券商订单号。
+
+        Returns:
+            Dict[str, Any]: 包含 timed_out、async_tracking、last_snapshot 等字段的快照；
+            不存在时返回空字典。
+        """
+        return dict(self._last_order_wait_results.get(str(order_id), {}) or {})
+
+    def _attach_order_wait_trace(self, row: Dict[str, Any], order_id: Any) -> None:
+        """把最近一次同步等待追踪字段追加到订单或成交快照。
+
+        Args:
+            row: 即将返回给调用方的订单或成交字典。
+            order_id: 远端券商订单号，可能为空。
+
+        Returns:
+            None: 原地更新 row。
+
+        Side Effects:
+            只追加 `timed_out`、`async_tracking`、`last_snapshot` 等可选诊断字段，
+            不覆盖券商查询得到的真实状态、成交数量和成交金额。
+        """
+
+        if not order_id:
+            return
+        wait_result = self._last_order_wait_results.get(str(order_id))
+        if not isinstance(wait_result, dict):
+            return
+        for key in ("timed_out", "async_tracking", "wait_timeout", "elapsed"):
+            if key in wait_result:
+                row[key] = wait_result.get(key)
+        snapshot = wait_result.get("last_snapshot")
+        if isinstance(snapshot, dict):
+            row["last_snapshot"] = dict(snapshot)
+            for key in ("order_remark", "strategy_name"):
+                if not row.get(key) and snapshot.get(key):
+                    row[key] = snapshot.get(key)
+            if row.get("raw_status") in (None, "") and snapshot.get("raw_status") not in (None, ""):
+                row["raw_status"] = snapshot.get("raw_status")
+
+    async def _maybe_wait(self, order_id: str, override_timeout: Optional[float] = None) -> Dict[str, Any]:
+        """根据 TRADE_MAX_WAIT_TIME 执行同步等待骨架（协程版）。
+
+        Args:
+            order_id: 已提交成功的券商订单号。
+            override_timeout: 本次请求覆盖的等待秒数；None 时读取全局配置。
+
+        Returns:
+            Dict[str, Any]: 等待结果。等待终态超时时返回 timed_out=True，
+            异步提交模式返回 async_tracking=True。
+        """
         from bullet_trade.utils.env_loader import get_live_trade_config
 
         if override_timeout is not None:
-            wait_s = float(override_timeout)
+            wait_source = override_timeout
         else:
-            wait_s = int(get_live_trade_config().get("trade_max_wait_time") or 0)
+            wait_source = get_live_trade_config().get("trade_max_wait_time") or 0
+        try:
+            wait_s = float(wait_source)
+        except (TypeError, ValueError):
+            log.warning(f"订单 {order_id} 等待窗口配置无效: {wait_source!r}，改为异步追踪")
+            wait_s = 0.0
         if wait_s <= 0:
             log.info(f"订单 {order_id} 采用异步模式（TRADE_MAX_WAIT_TIME<=0），交由后台同步任务跟踪")
-            return
+            result = {
+                "order_id": str(order_id),
+                "status": "submitted",
+                "timed_out": False,
+                "async_tracking": True,
+                "wait_timeout": wait_s,
+            }
+            self._last_order_wait_results[str(order_id)] = result
+            return dict(result)
         deadline = time.time() + wait_s
         interval = 0.5
         start = time.time()
@@ -973,7 +1049,15 @@ class QmtBroker(BrokerBase):
                     price=last_snapshot.get("price"),
                     filled=last_snapshot.get("filled"),
                 )
-                if st in ("filled", "cancelled", "canceled", "partly_canceled", "rejected"):
+                if st in (
+                    "filled",
+                    "cancelled",
+                    "canceled",
+                    "partly_canceled",
+                    "rejected",
+                    "failed",
+                    "error",
+                ):
                     final_status = st
                     break
             except Exception:
@@ -982,7 +1066,7 @@ class QmtBroker(BrokerBase):
         elapsed = time.time() - start
         if final_status:
             level = log.info
-            if final_status in ("rejected", "canceled", "cancelled"):
+            if final_status in ("rejected", "canceled", "cancelled", "failed", "error"):
                 level = log.error
             level(
                 f"订单 {order_id} 等待 {elapsed:.2f}s 获得状态 {final_status}，"
@@ -993,6 +1077,24 @@ class QmtBroker(BrokerBase):
                 f"订单 {order_id} 等待 {elapsed:.2f}s 仍未完成，"
                 f"最后快照={last_snapshot or '无'}，继续由异步同步逻辑追踪"
             )
+        result = {
+            "order_id": str(order_id),
+            "timed_out": final_status is None,
+            "async_tracking": final_status is None,
+            "wait_timeout": wait_s,
+            "elapsed": elapsed,
+        }
+        if last_snapshot:
+            result["last_snapshot"] = last_snapshot
+            result["status"] = final_status or str(last_snapshot.get("status") or "open")
+            if last_snapshot.get("raw_status") is not None:
+                result["raw_status"] = last_snapshot.get("raw_status")
+        elif final_status:
+            result["status"] = final_status
+        else:
+            result["status"] = "submitted"
+        self._last_order_wait_results[str(order_id)] = result
+        return dict(result)
 
     def _map_security(self, security: str) -> str:
         """将聚宽风格代码映射到 QMT 常见风格。
@@ -1256,26 +1358,26 @@ class QmtBroker(BrokerBase):
                     order_price = raw_price
                 if not oid:
                     continue
-                orders.append(
-                    {
-                        "order_id": str(oid),
-                        "security": self._map_to_jq_symbol(code) if code else None,
-                        "amount": amount,
-                        "filled": 0 if filled is None else filled,
-                        "price": 0.0 if traded_price is None else traded_price,
-                        "order_price": order_price,
-                        "status": status,
-                        "order_type": order_type,
-                        "is_buy": self._map_order_side(order_type),
-                        "order_remark": order_remark,
-                        "strategy_name": strategy_name,
-                        "order_sysid": order_sysid,
-                        "status_msg": status_msg,
-                        "price_type": price_type,
-                        "order_time": order_time,
-                        "broker_price": raw_price,
-                    }
-                )
+                row = {
+                    "order_id": str(oid),
+                    "security": self._map_to_jq_symbol(code) if code else None,
+                    "amount": amount,
+                    "filled": 0 if filled is None else filled,
+                    "price": 0.0 if traded_price is None else traded_price,
+                    "order_price": order_price,
+                    "status": status,
+                    "order_type": order_type,
+                    "is_buy": self._map_order_side(order_type),
+                    "order_remark": order_remark,
+                    "strategy_name": strategy_name,
+                    "order_sysid": order_sysid,
+                    "status_msg": status_msg,
+                    "price_type": price_type,
+                    "order_time": order_time,
+                    "broker_price": raw_price,
+                }
+                self._attach_order_wait_trace(row, oid)
+                orders.append(row)
                 _emit_order_debug(
                     "sync_orders_row",
                     order_id=str(oid),

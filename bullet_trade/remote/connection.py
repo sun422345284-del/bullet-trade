@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ssl
 import threading
 import time
@@ -9,6 +10,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from bullet_trade.core.globals import log
 from bullet_trade.server.protocol import ProtocolError, encode_message, read_message
+
+
+_REQUEST_TIMEOUT_DEFAULT = object()
 
 
 class RemoteQmtConnection:
@@ -26,12 +30,14 @@ class RemoteQmtConnection:
         *,
         tls_cert: Optional[str] = None,
         tls_enabled: bool = False,
+        request_timeout: float = 60.0,
     ) -> None:
         self.host = host
         self.port = port
         self.token = token
         self.tls_cert = tls_cert
         self.tls_enabled = tls_enabled and bool(tls_cert)
+        self.request_timeout = max(5.0, float(request_timeout))
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._reader: Optional[asyncio.StreamReader] = None
@@ -66,22 +72,34 @@ class RemoteQmtConnection:
         self._event_handlers.setdefault(event, []).append(handler)
 
     def request(
-        self, action: str, payload: Optional[Dict[str, Any]] = None, timeout: Optional[float] = 30.0
+        self, action: str, payload: Optional[Dict[str, Any]] = None, timeout: Any = _REQUEST_TIMEOUT_DEFAULT
     ) -> Dict:
+        """同步发送远程请求并等待响应。
+
+        Args:
+            action: 远程 action 名称，例如 `broker.place_order`。
+            payload: 请求 payload；为空时使用空字典。
+            timeout: 本次请求超时秒数。省略参数时使用连接默认 `request_timeout`；
+                显式传入 `None` 时保留旧版无限等待语义。
+
+        Returns:
+            Dict: 远程服务返回的响应字典。
+
+        Raises:
+            RuntimeError: 连接尚未启动时抛出。
+            TimeoutError: 请求超过有效 timeout 时抛出，并取消后台 pending future。
+        """
+
         if not self._loop:
             raise RuntimeError("remote connection 尚未启动")
         coro = self._request_async(action, payload or {})
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        if timeout is None:
-            return future.result()
-        while True:
-            try:
-                return future.result(timeout=timeout)
-            except TimeoutError:
-                if self._stop.is_set() or self._connected.is_set():
-                    raise
-                # 仍在重连，继续等待远程协程完成
-                continue
+        effective_timeout = self.request_timeout if timeout is _REQUEST_TIMEOUT_DEFAULT else timeout
+        try:
+            return future.result(timeout=effective_timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"request timed out: action={action}") from exc
 
     def subscribe(self, key: str, symbols: List[str]) -> Dict:
         current = self._subscriptions.setdefault(key, set())

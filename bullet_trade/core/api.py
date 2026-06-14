@@ -454,6 +454,7 @@ def get_open_orders() -> Dict[str, Order]:
         return {}
     open_states = {
         OrderStatus.new.value,
+        "submitted",
         OrderStatus.open.value,
         OrderStatus.filling.value,
         OrderStatus.canceling.value,

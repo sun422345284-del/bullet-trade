@@ -1688,6 +1688,38 @@ def test_get_orders_from_broker_includes_external_snapshots(tmp_path):
     assert set(target_order.keys()) == {"B2"}
 
 
+def test_live_engine_get_open_orders_includes_submitted_string_status(tmp_path):
+    """submitted 字符串状态应被视为 live 在途订单。"""
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="submitted-1",
+        security="000001.XSHE",
+        amount=100,
+        status="submitted",
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+
+    open_orders = engine.get_open_orders()
+
+    assert "submitted-1" in open_orders
+
+
 def test_apply_order_snapshots_prefers_filled_price_over_order_price(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {

@@ -84,6 +84,8 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 | `MARKET_BUY_PRICE_PERCENT` | `0.015` | 普通 `bullet-trade` 市价买入保护价偏移，参考价乘以 `1 + pct`，默认买高 1.5%。 |
 | `MARKET_SELL_PRICE_PERCENT` | `-0.015` | 普通 `bullet-trade` 市价卖出保护价偏移，参考价乘以 `1 + pct`，默认卖低 1.5%。 |
 | `TRADE_MAX_WAIT_TIME` | `16` | 实盘下单/撤单同步等待秒数；设为 `0` 或小于等于 `0` 时走异步立即返回。 |
+| `QMT_SERVER_RPC_TIMEOUT` | `60` | `qmt-remote` 客户端等待远程 server 响应的网络超时；应大于 `TRADE_MAX_WAIT_TIME` 或单次 `wait_timeout` 加安全余量。 |
+| `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单时在 `wait_timeout` 之外追加的请求超时安全余量，避免服务端刚返回 open/timed_out 时客户端先超时。 |
 | `MIN_BUY_ORDER_VALUE` | `0` | 最小买入订单金额；`0` 表示不限制，只拦截买入，不拦截卖出、降仓、清仓。 |
 | `RISK_CHECK_ENABLED` | `false` | 本地 LiveEngine 风控开关；开启后才使用本地风控参数。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 远程 QMT server 风控开关；开启后 server 端才使用风控参数。 |
@@ -174,6 +176,8 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | --- | --- | --- |
 | `ORDER_MAX_VOLUME` | `1000000` | 单笔委托最大股数，超过会拆单。 |
 | `TRADE_MAX_WAIT_TIME` | `16` | 下单/撤单同步等待秒数；小于等于 `0` 时异步立即返回。 |
+| `QMT_SERVER_RPC_TIMEOUT` | `60` | 远程 QMT 客户端默认 RPC 超时，只保护网络响应，不代表等待成交时间。 |
+| `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单请求超时相对订单等待窗口的默认余量。 |
 | `EVENT_TIME_OUT` | `60` | 策略事件超时秒数。 |
 | `STRATEGY_NAME` | 空 | 策略名称，用于订单备注和日志标识；未设置时通常用策略文件名。 |
 | `SCHEDULER_MARKET_PERIODS` | 空 | 覆盖交易时段，例如 `09:30-11:30,13:00-15:00`。 |

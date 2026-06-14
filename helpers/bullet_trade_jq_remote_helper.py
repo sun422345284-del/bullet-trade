@@ -38,6 +38,8 @@ _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
 # 全局调试开关
 _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
+DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
+DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 
 
 def _now_ns() -> int:
@@ -77,7 +79,8 @@ def configure(
     tls_cert: Optional[str] = None,
     retries: int = 2,
     retry_interval: float = 0.5,
-    rpc_timeout: float = 60.0,
+    rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS,
+    place_order_timeout_margin: float = DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
     debug: bool = True,
 ) -> None:
     """
@@ -93,6 +96,7 @@ def configure(
         retries: 失败重试次数，默认 2
         retry_interval: 重试间隔（秒），默认 0.5
         rpc_timeout: RPC 超时时间（秒），默认 60.0
+        place_order_timeout_margin: 下单请求超时相对 wait_timeout 的安全余量，默认 30.0
         debug: 是否启用调试日志，默认 True
     """
     global _CLIENT, _DATA_CLIENT, _BROKER_CLIENT, _DEBUG
@@ -114,6 +118,7 @@ def configure(
         _CLIENT,
         account_key=account_key,
         sub_account_id=sub_account_id,
+        place_order_timeout_margin=place_order_timeout_margin,
     )
     _BROKER_CLIENT.bind_data_client(_DATA_CLIENT)
     
@@ -186,6 +191,7 @@ class RemoteOrder:
     - is_buy: 是否买入
     - order_remark: 订单备注
     - strategy_name: 策略标识
+    - timed_out/async_tracking/last_snapshot: 新版 server 返回的等待超时追踪字段；旧 server 没有时保持默认值
     """
     def __init__(
         self,
@@ -200,6 +206,10 @@ class RemoteOrder:
         is_buy: Optional[bool] = None,
         order_remark: Optional[str] = None,
         strategy_name: Optional[str] = None,
+        timed_out: bool = False,
+        async_tracking: bool = False,
+        last_snapshot: Optional[Dict[str, Any]] = None,
+        raw_response: Optional[Dict[str, Any]] = None,
     ):
         self.order_id = order_id
         self.status = status
@@ -213,6 +223,10 @@ class RemoteOrder:
         self.is_buy = is_buy
         self.order_remark = order_remark
         self.strategy_name = strategy_name
+        self.timed_out = bool(timed_out)
+        self.async_tracking = bool(async_tracking)
+        self.last_snapshot = dict(last_snapshot or {})
+        self.raw_response = dict(raw_response or {})
 
 
 class RemoteTrade:
@@ -273,11 +287,13 @@ class RemoteBrokerClient:
         *,
         account_key: Optional[str] = None,
         sub_account_id: Optional[str] = None,
+        place_order_timeout_margin: float = DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
     ) -> None:
         self._client = client
         self.account_key = account_key
         self.sub_account_id = sub_account_id
         self._data_client: Optional[RemoteDataClient] = None
+        self.place_order_timeout_margin = max(0.0, float(place_order_timeout_margin))
 
     def bind_data_client(self, data_client: RemoteDataClient) -> None:
         self._data_client = data_client
@@ -541,7 +557,7 @@ class RemoteBrokerClient:
         orders = self.get_orders()
         if not orders:
             return {}
-        open_states = {"new", "open", "filling", "canceling"}
+        open_states = {"new", "submitted", "open", "filling", "canceling"}
         return {oid: order for oid, order in orders.items() if str(order.status) in open_states}
 
     def get_trades(
@@ -600,6 +616,10 @@ class RemoteBrokerClient:
             is_buy=bool(is_buy) if is_buy is not None else None,
             order_remark=str(order_remark) if order_remark is not None else None,
             strategy_name=str(strategy_name) if strategy_name is not None else None,
+            timed_out=bool(row.get("timed_out")),
+            async_tracking=bool(row.get("async_tracking")),
+            last_snapshot=row.get("last_snapshot") if isinstance(row.get("last_snapshot"), dict) else None,
+            raw_response=dict(row),
         )
 
     def _build_trade_snapshot(self, row: Dict[str, Any]) -> Optional[RemoteTrade]:
@@ -689,7 +709,21 @@ class RemoteBrokerClient:
                 payload["order_remark"] = effective_remark
             
             _log("DEBUG", "[下单] 发送下单请求: payload={}", payload)
-            resp = self._client.request("broker.place_order", payload)
+            try:
+                resp = self._request_place_order(
+                    "broker.place_order",
+                    payload,
+                    timeout=self._resolve_place_order_rpc_timeout(wait_timeout),
+                )
+            except Exception as exc:
+                if self._is_submit_unknown_timeout_error(exc):
+                    error_msg = (
+                        "下单请求超时，状态=submit_unknown，需要后续核对远端订单: "
+                        f"security={security}, amount={amount}, side={side}, error={exc}"
+                    )
+                    _log("ERROR", "[下单错误] {}", error_msg)
+                    raise RuntimeError(error_msg) from exc
+                raise
             _log("DEBUG", "[下单] 收到下单响应: resp={}", resp)
             
             # 处理服务端警告
@@ -714,6 +748,16 @@ class RemoteBrokerClient:
                 error_msg = f"下单失败，服务端返回错误订单号: {order_id}, 响应: {resp}"
                 _log("ERROR", "[下单错误] {}", error_msg)
                 raise RuntimeError(error_msg)
+
+            status = str(resp.get("status") or resp.get("order_status") or "").strip().lower()
+            if status == "submit_unknown":
+                error_msg = f"下单提交状态未知，需要后续核对远端订单: order_id={order_id}, 响应: {resp}"
+                _log("ERROR", "[下单错误] {}", error_msg)
+                raise RuntimeError(error_msg)
+            if status in {"rejected", "canceled", "cancelled", "failed", "error"}:
+                error_msg = f"下单失败，服务端返回终态失败: order_id={order_id}, status={status}, 响应: {resp}"
+                _log("ERROR", "[下单错误] {}", error_msg)
+                raise RuntimeError(error_msg)
             
             # 如果服务端返回了不同的数量，提示用户
             if actual_amount is not None and actual_amount != amount:
@@ -722,17 +766,24 @@ class RemoteBrokerClient:
             
             order = RemoteOrder(
                 order_id=str(order_id),
-                status=resp.get("status", "submitted") if isinstance(resp, dict) else "submitted",
+                status=status or "submitted",
                 security=security,
                 amount=amount,
                 price=price,
                 actual_amount=actual_amount,
                 actual_price=actual_price,
+                timed_out=bool(resp.get("timed_out")) if isinstance(resp, dict) else False,
+                async_tracking=bool(resp.get("async_tracking")) if isinstance(resp, dict) else False,
+                last_snapshot=resp.get("last_snapshot") if isinstance(resp.get("last_snapshot"), dict) else None,
+                raw_response=dict(resp) if isinstance(resp, dict) else {},
             )
             
-            _log("INFO", "[下单] 订单创建成功: order_id={}, status={}", order.order_id, order.status)
+            if order.status in {"open", "submitted", "new", "filling"} or order.timed_out or order.async_tracking:
+                _log("INFO", "[下单] 订单已提交，等待成交确认: order_id={}, status={}", order.order_id, order.status)
+            else:
+                _log("INFO", "[下单] 订单创建成功: order_id={}, status={}", order.order_id, order.status)
             
-            if wait_timeout and order.order_id:
+            if wait_timeout and order.order_id and not (order.timed_out or order.async_tracking):
                 _log("DEBUG", "[下单] 开始等待订单状态 (timeout={}s)", wait_timeout)
                 self._wait_order(order.order_id, wait_timeout)
             
@@ -743,6 +794,71 @@ class RemoteBrokerClient:
             _log("ERROR", "[下单错误] 堆栈:\n{}", traceback.format_exc())
             raise
 
+    def _resolve_place_order_rpc_timeout(self, wait_timeout: float) -> float:
+        """解析下单 RPC 请求超时时间。
+
+        Args:
+            wait_timeout: 本次下单等待终态秒数。
+
+        Returns:
+            float: 单次 RPC 接收响应超时时间。
+        """
+        try:
+            wait_seconds = float(wait_timeout or 0)
+        except (TypeError, ValueError):
+            wait_seconds = 0.0
+        rpc_timeout = max(5.0, float(getattr(self._client, "rpc_timeout", DEFAULT_RPC_TIMEOUT_SECONDS)))
+        if wait_seconds <= 0:
+            return rpc_timeout
+        return max(rpc_timeout, wait_seconds + self.place_order_timeout_margin)
+
+    def _request_place_order(
+        self,
+        action: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """发送下单请求，并兼容旧版 request 签名。
+
+        Args:
+            action: 远程 action 名称。
+            payload: 请求载荷。
+            timeout: 新版短连接客户端支持的单次请求超时。
+
+        Returns:
+            Dict[str, Any]: 远程响应。
+
+        兼容性:
+            部分外部用户或测试桩只实现 `request(action, payload)`，不接受
+            `timeout` 关键字。此处只在签名不兼容时回退旧调用，避免破坏旧 helper
+            使用方式；其他 TypeError 继续抛出。
+        """
+
+        try:
+            return self._client.request(action, payload, timeout=timeout)
+        except TypeError as exc:
+            message = str(exc)
+            if "timeout" not in message or "unexpected keyword" not in message:
+                raise
+            return self._client.request(action, payload)
+
+    @staticmethod
+    def _is_submit_unknown_timeout_error(exc: Exception) -> bool:
+        """判断下单异常是否属于无订单号的提交状态未知。
+
+        Args:
+            exc: 下单请求阶段抛出的异常。
+
+        Returns:
+            bool: True 表示应映射为 submit_unknown 风险；False 表示保留原异常语义。
+        """
+
+        if isinstance(exc, TimeoutError):
+            return True
+        message = str(exc).lower()
+        return "timeout" in message or "超时" in message
+
     def _wait_order(self, order_id: str, timeout: float) -> None:
         start = time.time()
         interval = 1.0
@@ -750,7 +866,15 @@ class RemoteBrokerClient:
             try:
                 status = self.get_order_status(order_id)
                 st = str(status.get("status") or "").lower()
-                if st in {"filled", "cancelled", "canceled", "rejected", "partly_canceled"}:
+                if st in {
+                    "filled",
+                    "cancelled",
+                    "canceled",
+                    "rejected",
+                    "partly_canceled",
+                    "failed",
+                    "error",
+                }:
                     return
             except Exception:
                 pass
@@ -793,7 +917,7 @@ class _ShortLivedClient:
         tls_cert: Optional[str] = None,
         retries: int = 2,
         retry_interval: float = 0.5,
-        rpc_timeout: float = 30.0,
+        rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS,
     ):
         self.host = host
         self.port = port
@@ -803,13 +927,19 @@ class _ShortLivedClient:
         self.retry_interval = max(0.1, float(retry_interval))
         self.rpc_timeout = max(5.0, float(rpc_timeout))
 
-    def request(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def request(
+        self,
+        action: str,
+        payload: Dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         发送 RPC 请求（每次调用都会建立新的 TCP 连接）。
         
         Args:
             action: RPC 动作名称，如 "broker.place_order"
             payload: 请求载荷
+            timeout: 本次请求超时；不传时使用客户端默认 rpc_timeout
             
         Returns:
             响应字典
@@ -817,6 +947,7 @@ class _ShortLivedClient:
         Raises:
             RuntimeError: 所有重试都失败后抛出最后一个异常
         """
+        effective_timeout = max(5.0, float(timeout or self.rpc_timeout))
         last_error: Optional[Exception] = None
         attempts = self.retries + 1
         request_start_time = time.time()
@@ -881,7 +1012,7 @@ class _ShortLivedClient:
                             time.sleep(self.retry_interval)
                         continue
                 
-                sock.settimeout(self.rpc_timeout)
+                sock.settimeout(effective_timeout)
                 
                 # ========== 3. 应用层握手 ==========
                 try:
@@ -945,7 +1076,7 @@ class _ShortLivedClient:
                 # ========== 5. 接收响应 ==========
                 response_start_time = time.time()
                 try:
-                    _log("DEBUG", "[RPC] [尝试 {}/{}] 等待 RPC 响应 (timeout={}s)", attempt, attempts, self.rpc_timeout)
+                    _log("DEBUG", "[RPC] [尝试 {}/{}] 等待 RPC 响应 (timeout={}s)", attempt, attempts, effective_timeout)
                     while True:
                         message = self._recv(sock)
                         msg_type = message.get("type")
@@ -968,7 +1099,7 @@ class _ShortLivedClient:
                             raise RuntimeError(f"服务器错误: {error_message}")
                             
                 except socket.timeout as e:
-                    error_msg = f"接收响应超时: timeout={self.rpc_timeout}s"
+                    error_msg = f"接收响应超时: timeout={effective_timeout}s"
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
                     _log("ERROR", "[RPC] [尝试 {}/{}] 堆栈:\n{}", attempt, attempts, traceback.format_exc())
                     last_error = RuntimeError(error_msg)

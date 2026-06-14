@@ -282,7 +282,7 @@ class ServerApplication:
         if method == "place_order":
             await self._store_idempotent_place_result(resolved_key, sub_cfg, payload, result)
         if sub_cfg:
-            result["sub_account_id"] = sub_cfg.sub_account_id
+            result = _attach_sub_account_id(result, sub_cfg.sub_account_id)
         return result
 
     async def _place_order_with_server_risk(
@@ -643,6 +643,31 @@ def _estimate_order_value(payload: Dict) -> Optional[float]:
     if amount and price:
         return amount * price
     return None
+
+
+def _attach_sub_account_id(result: Any, sub_account_id: str) -> Any:
+    """给 broker 返回结果追加子账户标识。
+
+    Args:
+        result: broker action 的返回值，通常是 dict 或 list[dict]。
+        sub_account_id: 已解析出的虚拟子账户 ID。
+
+    Returns:
+        Any: 保持原返回结构的结果；dict/list[dict] 会追加 `sub_account_id`。
+
+    Side Effects:
+        对 dict/list[dict] 做原地补充，避免旧调用方的返回形态发生变化。
+    """
+
+    if isinstance(result, dict):
+        result.setdefault("sub_account_id", sub_account_id)
+        return result
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                item.setdefault("sub_account_id", sub_account_id)
+        return result
+    return result
 
 
 def _build_place_order_fingerprint(payload: Dict) -> str:

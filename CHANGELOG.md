@@ -3,6 +3,23 @@
 本文档记录所有重要的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+- **远程 QMT 下单等待超时语义**：`broker.place_order` 在已拿到券商委托号但等待终态超时时返回 `open/submitted + timed_out=true` 的可追踪订单信息，避免客户端 RPC 超时掩盖真实委托号。
+- **远程请求超时预算**：`qmt-remote` 默认 RPC timeout 调整为 60 秒，并在下单时自动保证请求超时大于 `wait_timeout + QMT_PLACE_ORDER_TIMEOUT_MARGIN`，降低服务端刚返回 open/timed_out 前客户端先断开的概率。
+- **服务端请求窗口同步扩展**：server session 默认请求超时保持 60 秒；当 `broker.place_order` 显式传入更长 `wait_timeout` 时，外层请求窗口同步扩展到 `wait_timeout + 30s`，避免 server 先于下单等待窗口超时。
+- **远程默认等待窗口一致性**：`qmt-remote` 显式配置默认等待窗口时，会把同一个等待值传给 server 并用于 RPC timeout 预算；未配置时不额外写入 `wait_timeout`，保持旧 server 默认行为。
+- **长连接请求超时捕获**：显式捕获 `concurrent.futures.TimeoutError` 并转换为标准 `TimeoutError`，确保 Python 3.9 等环境下远程下单网络超时也能稳定进入 `submit_unknown` 保护路径，同时取消后台 pending future。
+
+### 兼容性
+- **新增字段保持可忽略**：`broker.place_order`、`broker.orders`、`broker.trades` 和聚宽 helper 订单对象新增 `timed_out`、`async_tracking`、`last_snapshot`、`sub_account_id` 等可选字段；原有返回结构和订单号字符串返回语义保持不变。
+- **未知提交状态保护**：网络超时且未拿到远端订单号时，客户端将该场景标记为 `submit_unknown` 风险并抛出异常，调用方应通过后续订单/成交查询确认，不应直接当作明确失败重复下单。
+- **聚宽 helper 超时余量可配置**：`bullet_trade_jq_remote_helper.configure()` 新增可选 `place_order_timeout_margin` 参数，默认 30 秒，旧调用方不需要调整；显式配置为 0 秒时不会被默认值覆盖。
+
+### 测试
+- 补充远程 QMT 下单等待超时、长连接请求超时清理、订单/成交追踪字段、helper 忽略未知新增字段、RPC timeout 安全余量和 `sub_account_id` list 返回兼容测试。
+
 ## [0.7.4] - 2026-06-08
 
 ### 修复

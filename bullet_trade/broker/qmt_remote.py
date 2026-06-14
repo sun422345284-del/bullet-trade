@@ -9,8 +9,50 @@ from ..remote import RemoteQmtConnection
 from ..core.globals import log
 
 
+DEFAULT_REMOTE_RPC_TIMEOUT_SECONDS = 60.0
+DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS = 30.0
+
+
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(key, default)
+
+
+def _safe_positive_float(value: Any, default: float) -> float:
+    """解析正数浮点配置。
+
+    Args:
+        value: 原始配置值。
+        default: 解析失败或非正数时使用的默认值。
+
+    Returns:
+        float: 正数浮点值。
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if parsed <= 0:
+        parsed = float(default)
+    return parsed
+
+
+def _safe_non_negative_float(value: Any, default: float) -> float:
+    """解析非负浮点配置。
+
+    Args:
+        value: 原始配置值。
+        default: 解析失败或为负数时使用的默认值。
+
+    Returns:
+        float: 非负浮点值。
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if parsed < 0:
+        parsed = float(default)
+    return parsed
 
 
 class RemoteQmtBroker(BrokerBase):
@@ -28,10 +70,65 @@ class RemoteQmtBroker(BrokerBase):
             raise RuntimeError("缺少 QMT_SERVER_TOKEN")
         tls_cert = self.config.get("tls_cert") or _env("QMT_SERVER_TLS_CERT")
         tls_enabled = bool(tls_cert)
+        self.rpc_timeout = _safe_positive_float(
+            self.config.get("rpc_timeout") or _env("QMT_SERVER_RPC_TIMEOUT"),
+            DEFAULT_REMOTE_RPC_TIMEOUT_SECONDS,
+        )
+        place_order_timeout_margin = self.config.get("place_order_timeout_margin")
+        if place_order_timeout_margin is None:
+            place_order_timeout_margin = _env("QMT_PLACE_ORDER_TIMEOUT_MARGIN")
+        self.place_order_timeout_margin = _safe_non_negative_float(
+            place_order_timeout_margin,
+            DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
+        )
+        default_wait_timeout = self.config.get("wait_timeout")
+        if default_wait_timeout is None:
+            default_wait_timeout = self.config.get("trade_max_wait_time")
+        if default_wait_timeout is None:
+            default_wait_timeout = _env("TRADE_MAX_WAIT_TIME")
+        self.default_wait_timeout = _safe_non_negative_float(default_wait_timeout, 0.0)
+        self._warn_if_timeout_budget_is_risky()
         self.account_key = self.config.get("account_key") or _env("QMT_SERVER_ACCOUNT_KEY")
         self.sub_account_id = self.config.get("sub_account_id") or _env("QMT_SERVER_SUB_ACCOUNT")
-        self._connection = RemoteQmtConnection(host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled)
+        self._connection = RemoteQmtConnection(
+            host,
+            port,
+            token,
+            tls_cert=tls_cert,
+            tls_enabled=tls_enabled,
+            request_timeout=self.rpc_timeout,
+        )
         self._last_warning: Optional[str] = None
+        self._last_order_responses: Dict[str, Dict[str, Any]] = {}
+
+    def _warn_if_timeout_budget_is_risky(self) -> None:
+        """检查远程下单默认超时预算是否存在明显风险。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            发现默认 RPC timeout 小于等于默认等待窗口时输出 warning；不抛异常，
+            以保持开源用户旧配置和旧 server 组合的启动兼容性。
+        """
+
+        if self.default_wait_timeout <= 0:
+            return
+        required = self.default_wait_timeout + self.place_order_timeout_margin
+        if self.rpc_timeout >= required:
+            return
+        log.warning(
+            "QMT remote 下单超时配置风险: QMT_SERVER_RPC_TIMEOUT=%.1fs, "
+            "TRADE_MAX_WAIT_TIME=%.1fs, QMT_PLACE_ORDER_TIMEOUT_MARGIN=%.1fs；"
+            "下单时会临时使用至少 %.1fs 的请求超时，建议同步调整默认配置。",
+            self.rpc_timeout,
+            self.default_wait_timeout,
+            self.place_order_timeout_margin,
+            required,
+        )
 
     def connect(self) -> bool:
         self._connection.start()
@@ -76,7 +173,7 @@ class RemoteQmtBroker(BrokerBase):
         orders = self.get_orders()
         if not orders:
             return []
-        open_states = {"new", "open", "filling", "canceling"}
+        open_states = {"new", "submitted", "open", "filling", "canceling"}
         return [row for row in orders if str(row.get("status")) in open_states]
 
     def get_trades(
@@ -190,8 +287,9 @@ class RemoteQmtBroker(BrokerBase):
                 style["price"] = price
         if price is None and not effective_market:
             raise ValueError("限价单缺少价格，请提供 price 或将 market 设为 True")
-        if wait_timeout is not None:
-            payload["wait_timeout"] = wait_timeout
+        effective_wait_timeout = self._resolve_order_wait_timeout(wait_timeout)
+        if effective_wait_timeout is not None:
+            payload["wait_timeout"] = effective_wait_timeout
         if effective_market:
             payload["market"] = True
         if remark:
@@ -204,7 +302,16 @@ class RemoteQmtBroker(BrokerBase):
                 "style": style,
             }
         )
-        resp = self._connection.request("broker.place_order", payload)
+        try:
+            resp = self._connection.request(
+                "broker.place_order",
+                payload,
+                timeout=self._resolve_place_order_rpc_timeout(effective_wait_timeout),
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"远程券商下单请求超时，状态=submit_unknown: side={side} security={security} amount={amount}"
+            ) from exc
         warning = None
         try:
             if isinstance(resp, dict):
@@ -221,7 +328,64 @@ class RemoteQmtBroker(BrokerBase):
         order_id = resp.get("order_id")
         if not order_id:
             raise RuntimeError(f"远程券商未返回 order_id: {resp}")
-        return order_id
+        status = str(resp.get("status") or resp.get("order_status") or "").strip().lower()
+        if status == "submit_unknown":
+            raise RuntimeError(f"远程券商下单提交状态未知: order_id={order_id} response={resp}")
+        if status in {"rejected", "canceled", "cancelled", "failed", "error"}:
+            raise RuntimeError(f"远程券商下单失败: order_id={order_id} status={status} response={resp}")
+        self._last_order_responses[str(order_id)] = dict(resp)
+        return str(order_id)
+
+    def get_last_order_response(self, order_id: str) -> Dict[str, Any]:
+        """读取最近一次下单响应。
+
+        Args:
+            order_id: 远端订单号。
+
+        Returns:
+            Dict[str, Any]: 服务端下单响应副本；没有记录时返回空字典。
+        """
+        return dict(self._last_order_responses.get(str(order_id), {}) or {})
+
+    def _resolve_order_wait_timeout(self, wait_timeout: Optional[float]) -> Optional[float]:
+        """解析本次要传给服务端的订单等待窗口。
+
+        Args:
+            wait_timeout: 单笔下单参数；None 表示使用远程券商配置默认值。
+
+        Returns:
+            Optional[float]: 应放入请求 payload 的等待秒数；None 表示保持旧行为，
+            由服务端自行读取默认配置。
+        """
+
+        if wait_timeout is not None:
+            try:
+                return max(0.0, float(wait_timeout))
+            except (TypeError, ValueError):
+                return 0.0
+        if self.default_wait_timeout > 0:
+            return self.default_wait_timeout
+        return None
+
+    def _resolve_place_order_rpc_timeout(self, wait_timeout: Optional[float]) -> float:
+        """解析下单 RPC 请求超时。
+
+        Args:
+            wait_timeout: 本次订单等待终态窗口。
+
+        Returns:
+            float: 远程下单请求超时时间，保证大于等待窗口。
+        """
+        if wait_timeout is not None:
+            try:
+                wait_seconds = float(wait_timeout)
+            except (TypeError, ValueError):
+                wait_seconds = 0.0
+        else:
+            wait_seconds = self.default_wait_timeout
+        if wait_seconds <= 0:
+            return self.rpc_timeout
+        return max(self.rpc_timeout, wait_seconds + self.place_order_timeout_margin)
 
     def _infer_price(self, security: str) -> Optional[float]:
         """

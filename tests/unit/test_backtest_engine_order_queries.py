@@ -118,6 +118,26 @@ def test_backtest_engine_order_trade_queries():
     assert "t1" in trades
 
 
+def test_backtest_engine_get_open_orders_includes_submitted_string_status():
+    """submitted 字符串状态应被视为在途订单。"""
+
+    engine = BacktestEngine(initialize=_dummy_initialize, handle_data=_dummy_handle_data)
+    order = Order(
+        order_id="submitted-1",
+        security="000001.XSHE",
+        amount=100,
+        price=10.0,
+        status="submitted",
+        add_time=datetime.datetime.now(),
+        is_buy=True,
+    )
+    engine._register_order(order)
+
+    open_orders = engine.get_open_orders()
+
+    assert "submitted-1" in open_orders
+
+
 def test_price_argument_creates_limit_order_style_for_order_helpers(monkeypatch):
     monkeypatch.setattr(
         "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
