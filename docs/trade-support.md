@@ -2,6 +2,13 @@
 
 这页只保留最小流程：聚宽策略如何连到远程 `bullet-trade server` 做真实下单。
 
+聚宽侧改策略有两种方式：
+
+- [聚宽接入方案 A：显式调用 helper](joinquant-helper-explicit.md)：下单处写 `bt.order(...)`、`bt.order_target_value(...)`。
+- [聚宽接入方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)：在 `process_initialize` 安装兼容层，原来的 `order(...)`、`context.portfolio` 尽量不改。
+
+两种方式的优缺点见 [聚宽策略接入方案对比](joinquant-integration-options.md)。
+
 ## 1. 先启动远程 server
 
 Windows 机器上的 `.env` 最少只要：
@@ -26,19 +33,20 @@ bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data 
 
 - `helpers/bullet_trade_jq_remote_helper.py`
 
-## 3. 在策略里最小配置
+## 3. 在策略里最小配置（显式 helper 调用）
 
 ```python
 import bullet_trade_jq_remote_helper as bt
 
-bt.configure(
-    host="your.server.ip",
-    port=58620,
-    token="secret",
-)
-
 def initialize(context):
     set_benchmark('000300.XSHG')
+
+def process_initialize(context):
+    bt.configure(
+        host="your.server.ip",
+        port=58620,
+        token="secret",
+    )
 
 def handle_data(context, data):
     bt.order('000001.XSHE', 100)

@@ -11,6 +11,10 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
 - [新手入门总览](beginner-guide.md)：先看 BulletTrade 目前支持的两种方案、结构图和选型方法，再进入对应文档。
 - [方案 A：独立运行](beginner-route-a.md)：策略在 BulletTrade 独立运行，连接本地 QMT。
 - [方案 B：聚宽侧模拟盘运行](beginner-route-b.md)：策略在聚宽侧模拟盘运行，BulletTrade 负责接收信号并在本地 QMT 执行。
+- [聚宽策略接入方案对比](joinquant-integration-options.md)：在聚宽侧运行策略时，比较显式调用 helper 和接管聚宽函数两种改法。
+- [聚宽接入方案 A：显式调用 helper](joinquant-helper-explicit.md)：下单处显式改成 `bt.order_target_value(...)` 等函数。
+- [聚宽接入方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)：回测不接管，模拟盘使用 BulletTrade 真实账户状态和远程下单，尽量减少策略代码改动。
+- [聚宽模拟盘完全接管设计说明](joinquant-live-takeover.md)：兼容层实现边界、账户代理、下单映射和验收清单。
 - [快速上手](quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
 - [研究环境（JupyterLab）](research.md)：`bullet-trade lab` 一键启动 Notebook，默认根目录、设置文件与示例说明。
 - [配置总览](config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。

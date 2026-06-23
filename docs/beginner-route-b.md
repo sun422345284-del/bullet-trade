@@ -260,7 +260,26 @@ print("持仓数量:", len(positions))
 
 ![聚宽研究 / Jupyter 中成功打印账户和持仓](assets/joinquant-jupyter-test.png)
 
-## 第七章：把聚宽模拟策略改成通过 helper 下单
+## 第七章：选择聚宽策略改法
+
+把聚宽策略接到 BulletTrade，有两种改法：
+
+| 方案 | 文档 | 特点 |
+| --- | --- | --- |
+| 聚宽接入方案 A：显式调用 helper | [方案 A：显式调用 helper](joinquant-helper-explicit.md) | 下单处改成 `bt.order(...)`、`bt.order_target_value(...)`，行为清楚，改动较多 |
+| 聚宽接入方案 B：接管聚宽函数 | [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md) | 在 `process_initialize` 安装兼容层，原策略的 `order(...)`、`context.portfolio` 尽量不改 |
+
+建议：
+
+- 第一次联调先用方案 A 在聚宽研究里查通账户和持仓。
+- 正式迁移存量聚宽模拟盘策略，优先看方案 B。
+- 如果策略只有一两个下单点，并且不依赖聚宽虚拟盘的现金和持仓判断，方案 A 也可以长期使用。
+
+更完整的优缺点对比见 [聚宽策略接入方案对比](joinquant-integration-options.md)。
+
+下面保留的是方案 A 的手动替换说明；如果你采用方案 B，直接看 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
+
+### 方案 A：显式调用 helper 的改法
 
 很多用户卡在这里。  
 核心原则其实很简单：
@@ -272,7 +291,7 @@ print("持仓数量:", len(positions))
 
 - [jq_remote_strategy_example.py](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/jq_remote_strategy_example.py)
 
-### 1. 文件头上要加什么
+#### 1. 文件头上要加什么
 
 这里建议你把文档理解成：  
 **保留你原来策略文件顶部的平台导入和原有逻辑，只新增 helper 相关代码。**
@@ -285,7 +304,7 @@ import bullet_trade_jq_remote_helper as bt
 
 如果你原来的策略文件已经能在平台侧正常运行，这里不要先去大改原来的导入。
 
-### 2. 远程服务器参数放在哪里
+#### 2. 远程服务器参数放在哪里
 
 建议直接写在策略文件开头，先用最直白的方式跑通：
 
@@ -295,7 +314,7 @@ BT_REMOTE_PORT = 58620
 BT_REMOTE_TOKEN = "secret"
 ```
 
-### 3. 初始化时要加什么
+#### 3. 初始化时要加什么
 
 聚宽环境会重启、刷新代码，所以更稳的写法是：  
 **在 `process_initialize` 里做 `bt.configure(...)`。**
@@ -322,7 +341,7 @@ def initialize(context):
     set_benchmark("000300.XSHG")
 ```
 
-### 4. 买卖的时候改哪些函数
+#### 4. 买卖的时候改哪些函数
 
 最常见就是把聚宽原来的下单函数，替换成 helper 对应函数。
 
@@ -347,7 +366,7 @@ bt.order("000001.XSHE", 100)
 bt.order_target_value("510300.XSHG", 100000)
 ```
 
-### 5. 第一次联调时怎么改最稳
+#### 5. 第一次联调时怎么改最稳
 
 不要一上来就把整个复杂策略全量改掉。  
 更稳的顺序是：

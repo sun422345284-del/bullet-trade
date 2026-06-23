@@ -74,6 +74,8 @@ flowchart TD
 - 聚宽负责产生交易动作
 - BulletTrade 只负责接收信号，并通过本地 QMT 下单
 
+> 聚宽侧改策略有两种方式：显式调用 helper，或接管聚宽函数。先看 [聚宽策略接入方案对比](joinquant-integration-options.md)，再选择 [方案 A：显式调用 helper](joinquant-helper-explicit.md) 或 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
+
 ## 怎么决策选哪种方案
 
 一句话判断：

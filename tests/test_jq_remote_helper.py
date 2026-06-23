@@ -20,6 +20,35 @@ class _RecordingClient:
         return {"order_id": "oid-1", "status": "open", "amount": payload.get("amount"), "price": 10.0}
 
 
+class _CompatClient(_RecordingClient):
+    def __init__(self):
+        super().__init__()
+        self.positions = [
+            {
+                "security": "000001.XSHE",
+                "amount": 300,
+                "closeable_amount": 200,
+                "avg_cost": 9.5,
+                "market_value": 3000.0,
+            }
+        ]
+
+    def request(self, action, payload, timeout=None):
+        self.requests.append((action, dict(payload)))
+        self.timeouts.append(timeout)
+        if action == "broker.account":
+            return {"value": {"available_cash": 88888.0, "total_value": 123456.0}}
+        if action == "broker.positions":
+            return self.positions
+        if action == "broker.orders":
+            return []
+        if action == "broker.trades":
+            return []
+        if action == "broker.order_status":
+            return {"order_id": payload.get("order_id"), "status": "filled"}
+        return {"order_id": "oid-compat", "status": "open", "amount": payload.get("amount"), "price": 10.0}
+
+
 class _TimedOutClient(_RecordingClient):
     def request(self, action, payload, timeout=None):
         self.requests.append((action, dict(payload)))
@@ -195,6 +224,16 @@ class _FakeDataClient:
     def get_last_price(self, security):
         assert security == "000001.XSHE"
         return 10.0
+
+
+class _RunParams:
+    def __init__(self, run_type):
+        self.type = run_type
+
+
+class _FakeContext:
+    def __init__(self, run_type):
+        self.run_params = _RunParams(run_type)
 
 
 def test_helper_restores_legacy_stringified_tuple_columns():
@@ -436,6 +475,198 @@ def test_helper_order_target_value_without_price_sends_market_buy_payload():
     assert payload["amount"] == 200
     assert payload["market"] is True
     assert payload["style"] == {"type": "market"}
+
+
+def test_helper_direct_order_accepts_market_order_style():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    broker.order("000001.XSHE", 100, helper.MarketOrderStyle(10.0), wait_timeout=0)
+
+    _, payload = client.requests[0]
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market", "protect_price": 10.0}
+
+
+def test_helper_direct_order_accepts_limit_order_style():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    broker.order("000001.XSHE", 100, helper.LimitOrderStyle(10.0), wait_timeout=0)
+
+    _, payload = client.requests[0]
+    assert "market" not in payload
+    assert payload["style"] == {"type": "limit", "price": 10.0}
+
+
+def test_helper_direct_percent_orders_use_remote_total_value():
+    client = _CompatClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    broker.order_percent("000001.XSHE", 0.1, wait_timeout=0)
+    broker.order_target_percent("000001.XSHE", 0.05, wait_timeout=0)
+
+    place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
+    assert place_orders[-2]["side"] == "BUY"
+    assert place_orders[-2]["amount"] == 1234
+    assert place_orders[-2]["wait_timeout"] == 0
+    assert place_orders[-1]["side"] == "BUY"
+    assert place_orders[-1]["amount"] == 317
+    assert place_orders[-1]["wait_timeout"] == 0
+
+
+def test_install_jq_compat_noops_in_backtest(monkeypatch):
+    calls = []
+
+    def fake_configure(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {"order": lambda *args, **kwargs: "jq-order"}
+    context = _FakeContext("full_backtest")
+
+    result = helper.install_jq_compat(
+        namespace,
+        context=context,
+        host="127.0.0.1",
+        token="secret",
+    )
+
+    assert result["enabled"] is False
+    assert calls == []
+    assert namespace["order"]() == "jq-order"
+
+
+def test_install_jq_compat_uses_remote_portfolio_and_default_wait(monkeypatch):
+    client = _CompatClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    def fake_configure(**kwargs):
+        helper._BROKER_CLIENT = broker
+        helper._DATA_CLIENT = broker._data_client
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {}
+    context = _FakeContext("sim_trade")
+
+    result = helper.install_jq_compat(
+        namespace,
+        context=context,
+        host="127.0.0.1",
+        token="secret",
+        default_wait_timeout=16,
+    )
+
+    assert result["enabled"] is True
+    assert context.portfolio.available_cash == 88888.0
+    assert context.portfolio.total_value == 123456.0
+    pos = context.portfolio.positions["000001.XSHE"]
+    assert pos.total_amount == 300
+    assert pos.closeable_amount == 200
+    assert pos.value == 3000.0
+    assert context.portfolio.positions["510300.XSHG"].total_amount == 0
+
+    order = namespace["order_target_value"]("000001.XSHE", 5000)
+
+    assert order.order_id == "oid-compat"
+    place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
+    assert place_orders[-1]["side"] == "BUY"
+    assert place_orders[-1]["amount"] == 200
+    assert place_orders[-1]["wait_timeout"] == 16.0
+    assert place_orders[-1]["style"] == {"type": "market"}
+
+
+def test_install_jq_compat_percent_orders_use_remote_total_value(monkeypatch):
+    client = _CompatClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    def fake_configure(**kwargs):
+        helper._BROKER_CLIENT = broker
+        helper._DATA_CLIENT = broker._data_client
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {}
+    context = _FakeContext("sim_trade")
+    helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
+
+    order = namespace["order_target_percent"]("000001.XSHE", 0.05)
+    namespace["order_percent"]("000001.XSHE", -0.01, wait_timeout=0)
+
+    assert order.order_id == "oid-compat"
+    assert order.is_buy is True
+    place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
+    assert place_orders[-2]["side"] == "BUY"
+    assert place_orders[-2]["amount"] == 317
+    assert place_orders[-2]["wait_timeout"] == 16.0
+    assert place_orders[-1]["side"] == "SELL"
+    assert place_orders[-1]["amount"] == 123
+    assert place_orders[-1]["wait_timeout"] == 0.0
+
+
+def test_install_jq_compat_order_style_mapping(monkeypatch):
+    client = _CompatClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    def fake_configure(**kwargs):
+        helper._BROKER_CLIENT = broker
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {}
+    context = _FakeContext("sim_trade")
+    helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
+
+    namespace["order"]("000001.XSHE", 100, helper.MarketOrderStyle(10.0))
+    namespace["order"]("000001.XSHE", 100, helper.LimitOrderStyle(9.9), wait_timeout=0)
+
+    place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
+    assert place_orders[-2]["style"] == {"type": "market", "protect_price": 10.0}
+    assert place_orders[-2]["market"] is True
+    assert place_orders[-2]["wait_timeout"] == 16.0
+    assert place_orders[-1]["style"] == {"type": "limit", "price": 9.9}
+    assert "market" not in place_orders[-1]
+    assert place_orders[-1]["wait_timeout"] == 0.0
+
+
+def test_install_jq_compat_order_target_value_rejects_conflicting_value_aliases(monkeypatch):
+    client = _CompatClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    def fake_configure(**kwargs):
+        helper._BROKER_CLIENT = broker
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {}
+    context = _FakeContext("sim_trade")
+    helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
+
+    with pytest.raises(TypeError, match="got both"):
+        namespace["order_target_value"]("000001.XSHE", 5000, target_value=6000)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"side": "short"},
+        {"pindex": 1},
+        {"close_today": True},
+    ],
+)
+def test_install_jq_compat_rejects_unsupported_scope(monkeypatch, kwargs):
+    broker = helper.RemoteBrokerClient(_CompatClient(), account_key="default")
+
+    def fake_configure(**configure_kwargs):
+        helper._BROKER_CLIENT = broker
+
+    monkeypatch.setattr(helper, "configure", fake_configure)
+    namespace = {}
+    context = _FakeContext("sim_trade")
+    helper.install_jq_compat(namespace, context=context, host="127.0.0.1", token="secret")
+
+    with pytest.raises(NotImplementedError):
+        namespace["order"]("000001.XSHE", 100, **kwargs)
 
 
 def test_helper_order_sends_optional_order_payload_fields():

@@ -9,12 +9,15 @@
    acct = bt.get_account()
    oid = bt.order('000001.XSHE', amount=100, price=None, side='BUY', wait_timeout=10)
    bt.cancel_order(oid)
+3. 如果希望聚宽模拟盘里尽量不改原策略下单代码，可在 process_initialize 里调用：
+   bt.install_jq_compat(globals(), context=context, host='你的IP', token='你的token')
 
 特点：
 - 每次调用都会重新建立 TCP 连接，适合聚宽频繁重启。
 - 服务端统一处理：最小手数/步进取整、停牌检查、价格笼子、涨跌停校验、可卖数量检查。
 - 支持同步/异步：wait_timeout>0 时轮询订单状态，否则立即返回。
 - 提供 account/positions/order_status/orders/cancel/order_value/order_target 等常见聚宽风格 API。
+- install_jq_compat 在回测中不接管；在聚宽模拟盘中接管账户状态和同名下单函数，默认同步等待 16 秒。
 """
 
 import ast
@@ -27,7 +30,7 @@ import struct
 import sys
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -40,6 +43,105 @@ _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
 DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
 DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
+DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
+
+
+class MarketOrderStyle:
+    """聚宽风格市价单样式，可选保护价。"""
+
+    def __init__(self, limit_price: Optional[float] = None):
+        self.limit_price = limit_price
+
+
+class LimitOrderStyle:
+    """聚宽风格限价单样式。"""
+
+    def __init__(self, limit_price: float):
+        self.limit_price = limit_price
+        self.price = limit_price
+
+
+def _style_class_name(style: Any) -> str:
+    return style.__class__.__name__ if style is not None else ""
+
+
+def _is_order_style(value: Any) -> bool:
+    name = _style_class_name(value)
+    return bool(name and "OrderStyle" in name)
+
+
+def _extract_style_price(style: Any) -> Optional[float]:
+    for attr in ("limit_price", "price"):
+        if hasattr(style, attr):
+            value = getattr(style, attr)
+            if value is not None:
+                return float(value)
+    return None
+
+
+def _resolve_price_market(
+    price: Optional[float] = None,
+    style: Optional[Any] = None,
+    market: Optional[bool] = None,
+) -> Tuple[Optional[float], Optional[bool]]:
+    """解析聚宽 style 和旧 helper price/market 语义。"""
+
+    if style is None and _is_order_style(price):
+        style = price
+        price = None
+    if style is None:
+        return price, market
+
+    name = _style_class_name(style)
+    if name in ("StopMarketOrderStyle", "StopLimitOrderStyle"):
+        raise NotImplementedError(f"{name} 暂不支持远程实盘接管")
+    if "Stop" in name and "OrderStyle" in name:
+        raise NotImplementedError(f"{name} 暂不支持远程实盘接管")
+    style_price = _extract_style_price(style)
+    effective_price = style_price if style_price is not None else price
+    if "MarketOrderStyle" in name:
+        return effective_price, True
+    if "LimitOrderStyle" in name:
+        if effective_price is None:
+            raise ValueError("限价单缺少价格")
+        return effective_price, False
+    if "OrderStyle" in name:
+        raise NotImplementedError(f"{name} 暂不支持远程实盘接管")
+    return price, market
+
+
+def _validate_jq_trade_scope(
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
+) -> None:
+    if pindex not in (0, None):
+        raise NotImplementedError("聚宽兼容接管第一版仅支持 pindex=0")
+    if close_today:
+        raise NotImplementedError("聚宽兼容接管第一版暂不支持 close_today=True")
+    if side is None:
+        return
+    side_text = str(side).strip().lower()
+    if side_text == "short":
+        raise NotImplementedError("聚宽兼容接管第一版暂不支持 side='short'")
+
+
+def _normalise_side(side: Optional[str], signed_value: float) -> str:
+    if side is not None:
+        side_text = str(side).strip().lower()
+        if side_text == "short":
+            raise NotImplementedError("聚宽兼容接管第一版暂不支持 side='short'")
+        if side_text in ("buy", "b"):
+            return "BUY"
+        if side_text in ("sell", "s"):
+            return "SELL"
+    return "BUY" if signed_value > 0 else "SELL"
+
+
+def _coerce_wait_timeout(value: Optional[float], default_wait_timeout: float) -> float:
+    if value is None:
+        return float(default_wait_timeout)
+    return float(value)
 
 
 def _now_ns() -> int:
@@ -307,6 +409,7 @@ class RemoteBrokerClient:
         side: Optional[str] = None,
         wait_timeout: float = 0,
         *,
+        style: Optional[Any] = None,
         market: Optional[bool] = None,
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
@@ -329,7 +432,8 @@ class RemoteBrokerClient:
         """
         if amount == 0:
             return ""
-        actual_side = side or ("BUY" if amount > 0 else "SELL")
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        actual_side = _normalise_side(side, amount)
         qty = abs(int(amount))
         # 服务端会自动处理最小手数/步进取整
         order = self._place_order(
@@ -352,6 +456,10 @@ class RemoteBrokerClient:
         price: Optional[float] = None,
         wait_timeout: float = 0,
         *,
+        style: Optional[Any] = None,
+        side: Optional[str] = None,
+        pindex: int = 0,
+        close_today: bool = False,
         market: Optional[bool] = None,
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
@@ -371,20 +479,22 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整，实际成交市值可能与请求略有偏差。
         """
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         if value == 0:
             return ""
+        price, market = _resolve_price_market(price=price, style=style, market=market)
         # 获取参考价格用于计算数量
         p = price or self._infer_price(security)
         if not p:
             raise RuntimeError("无法获取价格，无法按市值下单")
         # 计算大致数量，服务端会自动按最小手数/步进取整
         qty = int(abs(value) / p)
-        side = "BUY" if value > 0 else "SELL"
+        actual_side = _normalise_side(side, value)
         order = self._place_order(
             security,
             qty,
             price,
-            side,
+            actual_side,
             wait_timeout=wait_timeout,
             market=market,
             remark=remark,
@@ -393,6 +503,40 @@ class RemoteBrokerClient:
         )
         return order.order_id
 
+    def order_percent(
+        self,
+        security: str,
+        percent: float,
+        price: Optional[float] = None,
+        wait_timeout: float = 0,
+        *,
+        style: Optional[Any] = None,
+        side: Optional[str] = None,
+        pindex: int = 0,
+        close_today: bool = False,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
+        """按当前远程账户总资产的一定比例下单。"""
+
+        account = self.get_account()
+        return self.order_value(
+            security,
+            float(account.total_value) * float(percent),
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
+
     def order_target(
         self,
         security: str,
@@ -400,6 +544,10 @@ class RemoteBrokerClient:
         price: Optional[float] = None,
         wait_timeout: float = 0,
         *,
+        style: Optional[Any] = None,
+        side: Optional[str] = None,
+        pindex: int = 0,
+        close_today: bool = False,
         market: Optional[bool] = None,
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
@@ -419,6 +567,8 @@ class RemoteBrokerClient:
         
         注意：建议 target 为 100 的整数倍，服务端会自动取整。
         """
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
         current = self._current_amount(security)
         delta = target - current
         if delta == 0:
@@ -427,7 +577,9 @@ class RemoteBrokerClient:
             security,
             delta,
             price=price,
+            side=side,
             wait_timeout=wait_timeout,
+            style=style,
             market=market,
             remark=remark,
             order_remark=order_remark,
@@ -442,6 +594,10 @@ class RemoteBrokerClient:
         wait_timeout: float = 0,
         *,
         value: Optional[float] = None,
+        style: Optional[Any] = None,
+        side: Optional[str] = None,
+        pindex: int = 0,
+        close_today: bool = False,
         market: Optional[bool] = None,
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
@@ -461,12 +617,14 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整，实际市值可能与目标略有偏差。
         """
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         if target_value is None:
             if value is None:
                 raise TypeError("order_target_value() missing required argument: 'target_value' or 'value'")
             target_value = value
         elif value is not None:
             raise TypeError("order_target_value() got both 'target_value' and 'value'")
+        price, market = _resolve_price_market(price=price, style=style, market=market)
         p = price or self._infer_price(security)
         if not p:
             raise RuntimeError("无法获取价格，无法按目标市值下单")
@@ -477,6 +635,44 @@ class RemoteBrokerClient:
             target_amount,
             price=price,
             wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
+
+    def order_target_percent(
+        self,
+        security: str,
+        percent: float,
+        price: Optional[float] = None,
+        wait_timeout: float = 0,
+        *,
+        style: Optional[Any] = None,
+        side: Optional[str] = None,
+        pindex: int = 0,
+        close_today: bool = False,
+        market: Optional[bool] = None,
+        remark: Optional[str] = None,
+        order_remark: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> str:
+        """调仓到当前远程账户总资产的一定比例。"""
+
+        account = self.get_account()
+        return self.order_target_value(
+            security,
+            float(account.total_value) * float(percent),
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
             market=market,
             remark=remark,
             order_remark=order_remark,
@@ -1267,6 +1463,555 @@ def _df_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+# --------- 聚宽策略零改兼容层 ----------
+_JQ_COMPAT_STATE_KEY = "__bt_jq_compat_state__"
+_JQ_COMPAT_FUNCTIONS = [
+    "order",
+    "order_value",
+    "order_percent",
+    "order_target",
+    "order_target_value",
+    "order_target_percent",
+    "cancel_order",
+    "get_open_orders",
+    "get_orders",
+    "get_trades",
+]
+
+
+class _RemoteJQPosition:
+    """聚宽风格持仓对象，字段来自远程真实账户。"""
+
+    def __init__(self, source: Optional[RemotePosition] = None, security: Optional[str] = None):
+        if source is None:
+            self.security = security or ""
+            self.total_amount = 0
+            self.closeable_amount = 0
+            self.locked_amount = 0
+            self.value = 0.0
+            self.price = 0.0
+            self.avg_cost = 0.0
+            self.hold_cost = 0.0
+            self.market = None
+            return
+        self.security = source.security
+        self.total_amount = int(source.amount or 0)
+        self.closeable_amount = int(source.available or 0)
+        self.locked_amount = int(source.frozen or 0)
+        self.value = float(source.market_value or 0.0)
+        self.price = self.value / self.total_amount if self.total_amount else 0.0
+        self.avg_cost = float(source.avg_cost or 0.0)
+        self.hold_cost = self.avg_cost
+        self.market = source.market
+
+
+class _RemotePositionDict(dict):
+    """不存在的持仓返回空仓位，兼容聚宽常见写法。"""
+
+    def __missing__(self, key):
+        return _RemoteJQPosition(security=str(key))
+
+
+class _RemoteSnapshotCache:
+    def __init__(self, broker: RemoteBrokerClient, ttl_seconds: float = 1.0):
+        self.broker = broker
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self._snapshot: Optional[Dict[str, Any]] = None
+        self._snapshot_at = 0.0
+
+    def invalidate(self) -> None:
+        self._snapshot = None
+        self._snapshot_at = 0.0
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        if self._snapshot is not None and now - self._snapshot_at <= self.ttl_seconds:
+            return self._snapshot
+        account = self.broker.get_account()
+        raw_positions = self.broker.get_positions()
+        positions = _RemotePositionDict()
+        for pos in raw_positions:
+            positions[pos.security] = _RemoteJQPosition(pos)
+        positions_value = sum(float(pos.value or 0.0) for pos in positions.values())
+        self._snapshot = {
+            "account": account,
+            "positions": positions,
+            "positions_value": positions_value,
+        }
+        self._snapshot_at = now
+        return self._snapshot
+
+
+class _RemoteJQPortfolio:
+    def __init__(self, cache: _RemoteSnapshotCache):
+        self._cache = cache
+        self.subportfolios = []
+
+    @property
+    def available_cash(self) -> float:
+        return float(self._cache.snapshot()["account"].available_cash)
+
+    @property
+    def total_value(self) -> float:
+        return float(self._cache.snapshot()["account"].total_value)
+
+    @property
+    def positions_value(self) -> float:
+        return float(self._cache.snapshot()["positions_value"])
+
+    @property
+    def positions(self) -> _RemotePositionDict:
+        return self._cache.snapshot()["positions"]
+
+
+class _RemoteJQSubPortfolio(_RemoteJQPortfolio):
+    @property
+    def long_positions(self) -> _RemotePositionDict:
+        return self.positions
+
+    @property
+    def short_positions(self) -> Dict[str, _RemoteJQPosition]:
+        return {}
+
+    @property
+    def transferable_cash(self) -> float:
+        return self.available_cash
+
+    @property
+    def locked_cash(self) -> float:
+        return 0.0
+
+    @property
+    def type(self) -> str:
+        return "stock"
+
+
+def _run_type_from_context(context: Any) -> Optional[str]:
+    run_params = getattr(context, "run_params", None)
+    if isinstance(run_params, dict):
+        return run_params.get("type")
+    return getattr(run_params, "type", None)
+
+
+def _restore_jq_compat(namespace: Dict[str, Any]) -> None:
+    state = namespace.get(_JQ_COMPAT_STATE_KEY)
+    if not isinstance(state, dict) or not state.get("installed"):
+        return
+    originals = state.get("originals") or {}
+    for name, original in originals.items():
+        if original is None:
+            namespace.pop(name, None)
+        else:
+            namespace[name] = original
+    state["installed"] = False
+
+
+def _install_remote_context(context: Any, cache: _RemoteSnapshotCache) -> None:
+    portfolio = _RemoteJQPortfolio(cache)
+    subportfolio = _RemoteJQSubPortfolio(cache)
+    portfolio.subportfolios = [subportfolio]
+    setattr(context, "portfolio", portfolio)
+    setattr(context, "subportfolios", [subportfolio])
+
+
+def _extract_order_id(order_or_id: Any) -> str:
+    if hasattr(order_or_id, "order_id"):
+        return str(getattr(order_or_id, "order_id"))
+    return str(order_or_id)
+
+
+def _remote_order_result(
+    order_id: str,
+    security: str,
+    amount: int,
+    price: Optional[float],
+    is_buy: bool,
+) -> Optional[RemoteOrder]:
+    if not order_id:
+        return None
+    return RemoteOrder(
+        order_id=str(order_id),
+        status="submitted",
+        security=security,
+        amount=abs(int(amount or 0)),
+        price=float(price) if price is not None else None,
+        is_buy=bool(is_buy),
+    )
+
+
+def _style_for_jq_mirror(
+    style: Optional[Any],
+    price: Optional[float],
+    market: Optional[bool],
+) -> Optional[Any]:
+    if style is not None:
+        return style
+    if price is None:
+        return None
+    if market:
+        return MarketOrderStyle(price)
+    return LimitOrderStyle(price)
+
+
+def _mirror_jq_order(
+    original: Optional[Callable],
+    args,
+    kwargs,
+) -> None:
+    if not callable(original):
+        return
+    try:
+        original(*args, **kwargs)
+    except Exception as exc:
+        _warn("聚宽镜像下单失败，仅影响聚宽页面展示，不影响远程真实订单: {}", exc)
+
+
+def install_jq_compat(
+    namespace: Dict[str, Any],
+    *,
+    context: Any,
+    host: str,
+    token: str,
+    port: int = 58620,
+    account_key: Optional[str] = None,
+    sub_account_id: Optional[str] = None,
+    mirror_jq_orders: bool = False,
+    default_wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
+    tls_cert: Optional[str] = None,
+    retries: int = 2,
+    retry_interval: float = 0.5,
+    rpc_timeout: float = DEFAULT_RPC_TIMEOUT_SECONDS,
+    place_order_timeout_margin: float = DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS,
+    debug: bool = True,
+) -> Dict[str, Any]:
+    """安装聚宽模拟盘完全接管兼容层。
+
+    回测环境不接管；仅在 `context.run_params.type == "sim_trade"` 时接管
+    `context.portfolio`、`context.subportfolios` 和聚宽同名交易函数。
+    """
+
+    run_type = _run_type_from_context(context)
+    state = namespace.get(_JQ_COMPAT_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {
+            "originals": {name: namespace.get(name) for name in _JQ_COMPAT_FUNCTIONS},
+            "installed": False,
+        }
+        namespace[_JQ_COMPAT_STATE_KEY] = state
+
+    if run_type in ("simple_backtest", "full_backtest"):
+        _restore_jq_compat(namespace)
+        _log("INFO", "聚宽兼容层检测到回测环境 {}，不接管远程交易", run_type)
+        return {"enabled": False, "run_type": run_type, "reason": "backtest"}
+
+    if run_type != "sim_trade":
+        _restore_jq_compat(namespace)
+        _warn("聚宽兼容层未识别运行环境 run_params.type={}，默认不接管远程交易", run_type)
+        return {"enabled": False, "run_type": run_type, "reason": "unsupported_run_type"}
+
+    configure(
+        host=host,
+        port=port,
+        token=token,
+        account_key=account_key,
+        sub_account_id=sub_account_id,
+        tls_cert=tls_cert,
+        retries=retries,
+        retry_interval=retry_interval,
+        rpc_timeout=rpc_timeout,
+        place_order_timeout_margin=place_order_timeout_margin,
+        debug=debug,
+    )
+    broker = get_broker_client()
+    cache = _RemoteSnapshotCache(broker)
+    _install_remote_context(context, cache)
+    originals = state.get("originals") or {}
+
+    def compat_order(
+        security: str,
+        amount: int,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        remark = kwargs.pop("remark", None)
+        order_remark = kwargs.pop("order_remark", None)
+        idempotency_key = kwargs.pop("idempotency_key", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        order_id = broker.order(
+            security,
+            amount,
+            price=price,
+            side=_normalise_side(side, amount),
+            wait_timeout=wait_timeout,
+            market=market,
+            remark=remark,
+            order_remark=order_remark,
+            idempotency_key=idempotency_key,
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order"),
+                (security, amount, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(order_id, security, amount, price, amount > 0)
+
+    def compat_order_value(
+        security: str,
+        value: float,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        order_id = broker.order_value(
+            security,
+            value,
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=kwargs.pop("remark", None),
+            order_remark=kwargs.pop("order_remark", None),
+            idempotency_key=kwargs.pop("idempotency_key", None),
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order_value"),
+                (security, value, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(order_id, security, int(value), price, value > 0)
+
+    def compat_order_percent(
+        security: str,
+        percent: float,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        value = float(cache.snapshot()["account"].total_value) * float(percent)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        order_id = broker.order_value(
+            security,
+            value,
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=kwargs.pop("remark", None),
+            order_remark=kwargs.pop("order_remark", None),
+            idempotency_key=kwargs.pop("idempotency_key", None),
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order_percent"),
+                (security, percent, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(order_id, security, int(value), price, value > 0)
+
+    def compat_order_target(
+        security: str,
+        amount: int,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        current = broker._current_amount(security)
+        order_id = broker.order_target(
+            security,
+            amount,
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=kwargs.pop("remark", None),
+            order_remark=kwargs.pop("order_remark", None),
+            idempotency_key=kwargs.pop("idempotency_key", None),
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order_target"),
+                (security, amount, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(order_id, security, amount - current, price, amount >= current)
+
+    def compat_order_target_value(
+        security: str,
+        value: Optional[float] = None,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        has_target_value = "target_value" in kwargs
+        target_value = kwargs.pop("target_value", value)
+        if has_target_value and value is not None:
+            raise TypeError("order_target_value() got both 'value' and 'target_value'")
+        if target_value is None:
+            raise TypeError("order_target_value() missing required argument: 'value'")
+        current_value = float(cache.snapshot()["positions"][security].value)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        order_id = broker.order_target_value(
+            security,
+            target_value,
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=kwargs.pop("remark", None),
+            order_remark=kwargs.pop("order_remark", None),
+            idempotency_key=kwargs.pop("idempotency_key", None),
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order_target_value"),
+                (security, target_value, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(
+            order_id,
+            security,
+            int(float(target_value) - current_value),
+            price,
+            float(target_value) >= current_value,
+        )
+
+    def compat_order_target_percent(
+        security: str,
+        percent: float,
+        style: Optional[Any] = None,
+        side: str = "long",
+        pindex: int = 0,
+        close_today: bool = False,
+        **kwargs,
+    ) -> Optional[RemoteOrder]:
+        _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
+        snapshot = cache.snapshot()
+        target_value = float(snapshot["account"].total_value) * float(percent)
+        current_value = float(snapshot["positions"][security].value)
+        price = kwargs.pop("price", None)
+        wait_timeout = _coerce_wait_timeout(kwargs.pop("wait_timeout", None), default_wait_timeout)
+        market = kwargs.pop("market", None)
+        price, market = _resolve_price_market(price=price, style=style, market=market)
+        order_id = broker.order_target_value(
+            security,
+            target_value,
+            price=price,
+            wait_timeout=wait_timeout,
+            style=style,
+            side=side,
+            pindex=pindex,
+            close_today=close_today,
+            market=market,
+            remark=kwargs.pop("remark", None),
+            order_remark=kwargs.pop("order_remark", None),
+            idempotency_key=kwargs.pop("idempotency_key", None),
+        )
+        cache.invalidate()
+        if mirror_jq_orders and order_id:
+            mirror_style = _style_for_jq_mirror(style, price, market)
+            _mirror_jq_order(
+                originals.get("order_target_percent"),
+                (security, percent, mirror_style),
+                {"side": side, "pindex": pindex, "close_today": close_today},
+            )
+        return _remote_order_result(
+            order_id,
+            security,
+            int(target_value - current_value),
+            price,
+            target_value >= current_value,
+        )
+
+    def compat_cancel_order(order_or_id: Any) -> Dict[str, Any]:
+        result = broker.cancel_order(_extract_order_id(order_or_id))
+        cache.invalidate()
+        return result
+
+    namespace.update(
+        {
+            "order": compat_order,
+            "order_value": compat_order_value,
+            "order_percent": compat_order_percent,
+            "order_target": compat_order_target,
+            "order_target_value": compat_order_target_value,
+            "order_target_percent": compat_order_target_percent,
+            "cancel_order": compat_cancel_order,
+            "get_open_orders": lambda: broker.get_open_orders(),
+            "get_orders": broker.get_orders,
+            "get_trades": broker.get_trades,
+        }
+    )
+    state.update(
+        {
+            "installed": True,
+            "run_type": run_type,
+            "cache": cache,
+            "context": context,
+            "mirror_jq_orders": bool(mirror_jq_orders),
+            "default_wait_timeout": float(default_wait_timeout),
+        }
+    )
+    _log("INFO", "聚宽模拟盘完全接管已启用: account_key={}, sub_account_id={}", account_key, sub_account_id)
+    return {"enabled": True, "run_type": run_type}
+
+
 # --------- 便捷函数（JQ 兼容） ----------
 def order(
     security: str,
@@ -1275,6 +2020,7 @@ def order(
     side: Optional[str] = None,
     wait_timeout: float = 0,
     *,
+    style: Optional[Any] = None,
     market: Optional[bool] = None,
     remark: Optional[str] = None,
     order_remark: Optional[str] = None,
@@ -1286,6 +2032,7 @@ def order(
         price=price,
         side=side,
         wait_timeout=wait_timeout,
+        style=style,
         market=market,
         remark=remark,
         order_remark=order_remark,
@@ -1299,6 +2046,10 @@ def order_value(
     price: Optional[float] = None,
     wait_timeout: float = 0,
     *,
+    style: Optional[Any] = None,
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
     market: Optional[bool] = None,
     remark: Optional[str] = None,
     order_remark: Optional[str] = None,
@@ -1309,6 +2060,41 @@ def order_value(
         value,
         price=price,
         wait_timeout=wait_timeout,
+        style=style,
+        side=side,
+        pindex=pindex,
+        close_today=close_today,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
+
+
+def order_percent(
+    security: str,
+    percent: float,
+    price: Optional[float] = None,
+    wait_timeout: float = 0,
+    *,
+    style: Optional[Any] = None,
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order_percent(
+        security,
+        percent,
+        price=price,
+        wait_timeout=wait_timeout,
+        style=style,
+        side=side,
+        pindex=pindex,
+        close_today=close_today,
         market=market,
         remark=remark,
         order_remark=order_remark,
@@ -1322,6 +2108,10 @@ def order_target(
     price: Optional[float] = None,
     wait_timeout: float = 0,
     *,
+    style: Optional[Any] = None,
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
     market: Optional[bool] = None,
     remark: Optional[str] = None,
     order_remark: Optional[str] = None,
@@ -1332,6 +2122,10 @@ def order_target(
         target,
         price=price,
         wait_timeout=wait_timeout,
+        style=style,
+        side=side,
+        pindex=pindex,
+        close_today=close_today,
         market=market,
         remark=remark,
         order_remark=order_remark,
@@ -1346,6 +2140,10 @@ def order_target_value(
     wait_timeout: float = 0,
     *,
     value: Optional[float] = None,
+    style: Optional[Any] = None,
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
     market: Optional[bool] = None,
     remark: Optional[str] = None,
     order_remark: Optional[str] = None,
@@ -1357,6 +2155,41 @@ def order_target_value(
         price=price,
         wait_timeout=wait_timeout,
         value=value,
+        style=style,
+        side=side,
+        pindex=pindex,
+        close_today=close_today,
+        market=market,
+        remark=remark,
+        order_remark=order_remark,
+        idempotency_key=idempotency_key,
+    )
+
+
+def order_target_percent(
+    security: str,
+    percent: float,
+    price: Optional[float] = None,
+    wait_timeout: float = 0,
+    *,
+    style: Optional[Any] = None,
+    side: Optional[str] = None,
+    pindex: int = 0,
+    close_today: bool = False,
+    market: Optional[bool] = None,
+    remark: Optional[str] = None,
+    order_remark: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return get_broker_client().order_target_percent(
+        security,
+        percent,
+        price=price,
+        wait_timeout=wait_timeout,
+        style=style,
+        side=side,
+        pindex=pindex,
+        close_today=close_today,
         market=market,
         remark=remark,
         order_remark=order_remark,
@@ -1407,12 +2240,15 @@ def get_positions() -> List[RemotePosition]:
 
 __all__ = [
     "configure",
+    "install_jq_compat",
     "get_data_client",
     "get_broker_client",
     "order",
     "order_value",
+    "order_percent",
     "order_target",
     "order_target_value",
+    "order_target_percent",
     "cancel_order",
     "get_order_status",
     "get_open_orders",
@@ -1420,6 +2256,8 @@ __all__ = [
     "get_trades",
     "get_account",
     "get_positions",
+    "MarketOrderStyle",
+    "LimitOrderStyle",
     "RemoteAccount",
     "RemoteOrder",
     "RemoteTrade",
