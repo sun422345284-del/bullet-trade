@@ -721,19 +721,19 @@ def print_metrics(metrics: Dict[str, float]):
     for key, value in metrics.items():
         if '收益' in key or '波动' in key or '回撤' in key or '率' in key:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.2f}%")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.2f}%")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
         elif '比率' in key or '比' in key:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.2f}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.2f}")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
         else:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.0f}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.0f}")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
     
     print("=" * 70)
 
